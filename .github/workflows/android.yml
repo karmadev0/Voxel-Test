@@ -7,7 +7,9 @@ on:
   push:
     branches: [main]
     paths:
-      - "voxel-engine/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/android.yml"
   pull_request:
     branches: [main]
@@ -22,9 +24,6 @@ env:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: voxel-engine
 
     steps:
       - name: Checkout
@@ -41,8 +40,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            voxel-engine/target
-          key: ${{ runner.os }}-cargo-android-${{ hashFiles('voxel-engine/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-android-
 
@@ -88,6 +87,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: voxel-engine-android
-          path: voxel-engine/${{ steps.locate.outputs.apk_path }}
+          path: ${{ steps.locate.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 14
