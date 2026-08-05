@@ -59,46 +59,16 @@ jobs:
       - name: Instalar cargo-apk
         run: cargo install cargo-apk --locked
 
-      - name: Generar keystore de release (autofirmada)
-        # cargo-apk exige firmar los builds --release con una keystore
-        # propia (a diferencia de debug, que usa ~/.android/debug.keystore
-        # y se autogenera). Esta keystore se crea de cero en cada run del
-        # workflow, así que sirve para instalar/probar el APK pero NO es
-        # apta para subir a Play Store ni para actualizar una instalación
-        # existente (la firma cambia en cada build). Si en algún momento
-        # necesitás firma estable entre builds, generá una keystore una
-        # sola vez, subila como secret del repo, y reemplazá este paso por
-        # uno que la restaure desde el secret.
-        run: |
-          keytool -genkeypair -v \
-            -keystore release.keystore \
-            -alias voxelengine \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android -keypass android \
-            -dname "CN=Voxel Engine, OU=Dev, O=Karma, L=Unknown, S=Unknown, C=VE"
-
-      - name: cargo apk build --release
+      - name: cargo apk build (debug)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-          # cargo-apk empaqueta el APK con la clave de debug de Android
-          # por defecto (~/.android/debug.keystore, se crea sola si no
-          # existe), suficiente para instalar/probar en un dispositivo o
-          # emulador. Para publicar en Play Store hay que firmar con una
-          # clave de release propia — no es lo que hace este workflow.
-          #
-          # Compilamos solo aarch64: cubre prácticamente todos los
-          # celulares/tablets Android reales de los últimos ~8 años. Se
-          # puede agregar `--target x86_64-linux-android` para probar en
-          # el emulador de Android Studio (que suele correr sobre x86_64).
           RUST_LOG: info
-          CARGO_APK_RELEASE_KEYSTORE: ${{ github.workspace }}/release.keystore
-          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: android
-        run: cargo apk build --release --lib --target aarch64-linux-android
+        run: cargo apk build --lib --target aarch64-linux-android
 
       - name: Ubicar el APK generado
         id: locate
         run: |
-          APK_PATH=$(find target -name "*.apk" -path "*release*" | head -n 1)
+          APK_PATH=$(find target -name "*.apk" | head -n 1)
           if [ -z "$APK_PATH" ]; then
             echo "No se encontró ningún .apk bajo target/" >&2
             find target -maxdepth 4 -type d >&2
@@ -114,4 +84,3 @@ jobs:
           path: ${{ steps.locate.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 14
-
