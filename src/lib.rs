@@ -30,10 +30,11 @@ use std::time::Instant;
 use touch::{TouchAction, TouchController};
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    application::ApplicationHandler,
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::PhysicalKey,
-    window::{CursorGrabMode, WindowBuilder},
+    window::{CursorGrabMode, Window, WindowId},
 };
 use world::{raycast, World};
 
@@ -793,196 +794,204 @@ pub fn run_desktop() {
     run(event_loop);
 }
 
-/// Loop principal, común a desktop y Android. En Android, la ventana no
-/// se crea hasta el primer `Event::Resumed` (la superficie nativa todavía
-/// no existe al arrancar la Activity), así que el `State` de wgpu se
-/// inicializa recién ahí — y se reconstruye si Android la destruye y
-/// recrea al volver de segundo plano.
-pub fn run(event_loop: EventLoop<()>) {
-    event_loop.set_control_flow(ControlFlow::Poll);
+/// Estado de la app para el nuevo modelo de `winit` 0.30+ (`ApplicationHandler`,
+/// en reemplazo del closure único que usaba `event_loop.run(...)` en 0.29).
+/// Contiene lo mismo que antes vivía como variables capturadas por el closure.
+#[derive(Default)]
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
+}
 
-    // En desktop se crean apenas arranca el loop. En Android no podemos
-    // crearlas hasta el primer `Resumed` (recién ahí existe la superficie
-    // nativa), así que ambas plataformas comparten este mismo camino
-    // diferido: en desktop el primer `Resumed` llega casi enseguida, así
-    // que el efecto práctico es el mismo que crearlas de una.
-    let mut window: Option<Arc<winit::window::Window>> = None;
-    let mut state: Option<State> = None;
+impl ApplicationHandler for App {
+    // En Android, la ventana no se crea hasta el primer `resumed()` (la
+    // superficie nativa todavía no existe al arrancar la Activity), así
+    // que el `State` de wgpu se inicializa recién ahí — y se reconstruye
+    // si Android la destruye y recrea al volver de segundo plano.
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_none() {
+            let attrs = Window::default_attributes()
+                .with_title("Voxel Engine - Fase 4")
+                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+            let win = Arc::new(event_loop.create_window(attrs).unwrap());
+            let new_state = pollster::block_on(State::new(win.clone()));
+            self.window = Some(win);
+            self.state = Some(new_state);
+        } else if self.state.is_none() {
+            // Android destruyó la superficie al pasar a segundo plano
+            // (ver `suspended()` más abajo) y ahora, al volver, nos avisa
+            // que hay una superficie nueva.
+            let win = self.window.as_ref().unwrap();
+            self.state = Some(pollster::block_on(State::new(win.clone())));
+        }
+    }
 
-    event_loop
-        .run(move |event, elwt| match event {
-            Event::Resumed => {
-                if window.is_none() {
-                    let win = Arc::new(
-                        WindowBuilder::new()
-                            .with_title("Voxel Engine - Fase 4")
-                            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
-                            .build(elwt)
-                            .unwrap(),
-                    );
-                    let new_state = pollster::block_on(State::new(win.clone()));
-                    window = Some(win);
-                    state = Some(new_state);
-                } else if state.is_none() {
-                    // Android destruyó la superficie al pasar a segundo
-                    // plano (ver `Event::Suspended` más abajo) y ahora,
-                    // al volver, nos avisa que hay una superficie nueva.
-                    let win = window.as_ref().unwrap();
-                    state = Some(pollster::block_on(State::new(win.clone())));
-                }
-            }
-            // Solo llega en Android: la Activity puede pasar a segundo
-            // plano y el sistema operativo destruir la superficie nativa
-            // en cualquier momento. Soltamos el `State` (que retiene el
-            // `wgpu::Surface` apuntando a esa superficie) para no quedar
-            // con un handle inválido; se reconstruye en el próximo
-            // `Resumed`.
-            Event::Suspended => {
-                state = None;
-            }
-            Event::WindowEvent {
-                event: ref window_event,
-                window_id,
-            } => {
-                let (Some(window), Some(state)) = (window.as_ref(), state.as_mut()) else {
-                    return;
-                };
-                if window_id != window.id() {
-                    return;
-                }
-                match window_event {
-                WindowEvent::CloseRequested => {
-                    let saved = state.world.save_dirty_chunks();
-                    if saved > 0 {
-                        log::info!("Guardados {} chunks modificados antes de salir.", saved);
-                    }
-                    elwt.exit();
-                }
-                WindowEvent::Resized(physical_size) => state.resize(*physical_size),
-                WindowEvent::MouseInput {
-                    state: btn_state,
-                    button,
-                    ..
-                } => {
-                    if !state.mouse_captured {
-                        // El primer click solo captura el mouse (como en
-                        // cualquier juego 3D en navegador/PC), no rompe ni
-                        // coloca nada todavía.
-                        if *btn_state == ElementState::Pressed {
-                            state.mouse_captured = true;
-                            let _ = window
-                                .set_cursor_grab(CursorGrabMode::Confined)
-                                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
-                            window.set_cursor_visible(false);
-                        }
-                    } else if *btn_state == ElementState::Pressed {
-                        state.handle_click(*button);
-                    }
-                }
-                WindowEvent::Touch(touch) => {
-                    if let Some(action) = state.touch.on_touch(*touch, state.size) {
-                        match action {
-                            TouchAction::Break => state.handle_click(MouseButton::Left),
-                            TouchAction::Place => state.handle_click(MouseButton::Right),
-                            TouchAction::SelectBlock(n) => {
-                                state.selected_block = match n {
-                                    1 => BlockType::Grass,
-                                    2 => BlockType::Dirt,
-                                    _ => BlockType::Stone,
-                                };
-                            }
-                        }
-                    }
-                }
-                WindowEvent::KeyboardInput { event, .. } => {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        if code == winit::keyboard::KeyCode::Escape
-                            && event.state == ElementState::Pressed
-                        {
-                            state.mouse_captured = false;
-                            let _ = window.set_cursor_grab(CursorGrabMode::None);
-                            window.set_cursor_visible(true);
-                        } else if event.state == ElementState::Pressed
-                            && code == winit::keyboard::KeyCode::KeyF
-                        {
-                            // Toggle entre modo caminar (gravedad + colisión)
-                            // y modo vuelo libre (útil para construir rápido
-                            // o inspeccionar el mundo desde arriba).
-                            state.walk_mode = !state.walk_mode;
-                            if state.walk_mode {
-                                // Sincronizamos al jugador con la posición
-                                // actual de la cámara para no teletransportar
-                                // ni hacer que caiga desde donde volaba.
-                                state.player.feet_position =
-                                    state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
-                                state.player.velocity = glam::Vec3::ZERO;
-                            }
-                        } else if event.state == ElementState::Pressed
-                            && code == winit::keyboard::KeyCode::F5
-                        {
-                            let saved = state.world.save_dirty_chunks();
-                            log::info!("Guardado manual: {} chunks escritos a disco.", saved);
-                        } else if event.state == ElementState::Pressed
-                            && matches!(
-                                code,
-                                winit::keyboard::KeyCode::Digit1
-                                    | winit::keyboard::KeyCode::Digit2
-                                    | winit::keyboard::KeyCode::Digit3
-                            )
-                        {
-                            // Selección de bloque para colocar (hotbar simple).
-                            state.selected_block = match code {
-                                winit::keyboard::KeyCode::Digit1 => BlockType::Grass,
-                                winit::keyboard::KeyCode::Digit2 => BlockType::Dirt,
-                                _ => BlockType::Stone,
-                            };
-                        } else {
-                            state.camera.process_key(code, event.state);
-                        }
-                    }
-                }
-                WindowEvent::RedrawRequested => {
-                    state.update();
-                    match state.render() {
-                        Ok(_) => {}
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                        Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                        Err(e) => log::warn!("Error de render: {:?}", e),
-                    }
+    // Solo llega en Android: la Activity puede pasar a segundo plano y el
+    // sistema operativo destruir la superficie nativa en cualquier
+    // momento. Soltamos el `State` (que retiene el `wgpu::Surface`
+    // apuntando a esa superficie) para no quedar con un handle inválido;
+    // se reconstruye en el próximo `resumed()`.
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.state = None;
+    }
 
-                    // Actualizamos el título de la ventana con el FPS una
-                    // vez por segundo, para no gastar tiempo de CPU
-                    // formateando strings en cada frame.
-                    if let Some(fps) = state.tick_fps() {
-                        let mode = if state.walk_mode { "Caminar" } else { "Vuelo" };
-                        window.set_title(&format!(
-                            "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F: modo, F5: guardar",
-                            fps,
-                            state.chunk_meshes.len(),
-                            mode,
-                            state.selected_block
-                        ));
-                    }
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let (Some(window), Some(state)) = (self.window.as_ref(), self.state.as_mut()) else {
+            return;
+        };
+        if window_id != window.id() {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                let saved = state.world.save_dirty_chunks();
+                if saved > 0 {
+                    log::info!("Guardados {} chunks modificados antes de salir.", saved);
                 }
-                _ => {}
-                }
+                event_loop.exit();
             }
-            Event::DeviceEvent {
-                event: DeviceEvent::MouseMotion { delta },
+            WindowEvent::Resized(physical_size) => state.resize(physical_size),
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
                 ..
             } => {
-                if let Some(state) = state.as_mut() {
-                    if state.mouse_captured {
-                        state.camera.process_mouse(delta.0, delta.1);
+                if !state.mouse_captured {
+                    // El primer click solo captura el mouse (como en
+                    // cualquier juego 3D en navegador/PC), no rompe ni
+                    // coloca nada todavía.
+                    if btn_state == ElementState::Pressed {
+                        state.mouse_captured = true;
+                        let _ = window
+                            .set_cursor_grab(CursorGrabMode::Confined)
+                            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
+                        window.set_cursor_visible(false);
+                    }
+                } else if btn_state == ElementState::Pressed {
+                    state.handle_click(button);
+                }
+            }
+            WindowEvent::Touch(touch) => {
+                if let Some(action) = state.touch.on_touch(touch, state.size) {
+                    match action {
+                        TouchAction::Break => state.handle_click(MouseButton::Left),
+                        TouchAction::Place => state.handle_click(MouseButton::Right),
+                        TouchAction::SelectBlock(n) => {
+                            state.selected_block = match n {
+                                1 => BlockType::Grass,
+                                2 => BlockType::Dirt,
+                                _ => BlockType::Stone,
+                            };
+                        }
                     }
                 }
             }
-            Event::AboutToWait => {
-                if let Some(window) = window.as_ref() {
-                    window.request_redraw();
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == winit::keyboard::KeyCode::Escape
+                        && event.state == ElementState::Pressed
+                    {
+                        state.mouse_captured = false;
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                    } else if event.state == ElementState::Pressed
+                        && code == winit::keyboard::KeyCode::KeyF
+                    {
+                        // Toggle entre modo caminar (gravedad + colisión)
+                        // y modo vuelo libre (útil para construir rápido
+                        // o inspeccionar el mundo desde arriba).
+                        state.walk_mode = !state.walk_mode;
+                        if state.walk_mode {
+                            // Sincronizamos al jugador con la posición
+                            // actual de la cámara para no teletransportar
+                            // ni hacer que caiga desde donde volaba.
+                            state.player.feet_position =
+                                state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
+                            state.player.velocity = glam::Vec3::ZERO;
+                        }
+                    } else if event.state == ElementState::Pressed
+                        && code == winit::keyboard::KeyCode::F5
+                    {
+                        let saved = state.world.save_dirty_chunks();
+                        log::info!("Guardado manual: {} chunks escritos a disco.", saved);
+                    } else if event.state == ElementState::Pressed
+                        && matches!(
+                            code,
+                            winit::keyboard::KeyCode::Digit1
+                                | winit::keyboard::KeyCode::Digit2
+                                | winit::keyboard::KeyCode::Digit3
+                        )
+                    {
+                        // Selección de bloque para colocar (hotbar simple).
+                        state.selected_block = match code {
+                            winit::keyboard::KeyCode::Digit1 => BlockType::Grass,
+                            winit::keyboard::KeyCode::Digit2 => BlockType::Dirt,
+                            _ => BlockType::Stone,
+                        };
+                    } else {
+                        state.camera.process_key(code, event.state);
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                state.update();
+                match state.render() {
+                    Ok(_) => {}
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                    Err(e) => log::warn!("Error de render: {:?}", e),
+                }
+
+                // Actualizamos el título de la ventana con el FPS una vez
+                // por segundo, para no gastar tiempo de CPU formateando
+                // strings en cada frame.
+                if let Some(fps) = state.tick_fps() {
+                    let mode = if state.walk_mode { "Caminar" } else { "Vuelo" };
+                    window.set_title(&format!(
+                        "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F: modo, F5: guardar",
+                        fps,
+                        state.chunk_meshes.len(),
+                        mode,
+                        state.selected_block
+                    ));
                 }
             }
             _ => {}
-        })
-        .unwrap();
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if let Some(state) = self.state.as_mut() {
+                if state.mouse_captured {
+                    state.camera.process_mouse(delta.0, delta.1);
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+}
+
+/// Loop principal, común a desktop y Android. Arranca el `ApplicationHandler`
+/// de arriba, que reemplaza al closure único que usaba `event_loop.run(...)`
+/// en winit 0.29 (API vieja, deprecada y quitada en 0.30+).
+pub fn run(event_loop: EventLoop<()>) {
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = App::default();
+    event_loop.run_app(&mut app).unwrap();
 }

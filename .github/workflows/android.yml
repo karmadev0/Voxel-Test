@@ -7,8 +7,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "src/**"
-      - "Cargo.toml"
+      - "voxel-engine/**"
       - ".github/workflows/android.yml"
   pull_request:
     branches: [main]
@@ -23,6 +22,9 @@ env:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: voxel-engine
 
     steps:
       - name: Checkout
@@ -39,8 +41,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-android-${{ hashFiles('Cargo.lock') }}
+            voxel-engine/target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('voxel-engine/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-android-
 
@@ -51,24 +53,29 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
 
-      - name: Instalar plataforma de Android SDK (API 30)
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-30"
-
       - name: Instalar cargo-apk
         run: cargo install cargo-apk --locked
 
-      - name: cargo apk build (debug)
+      - name: cargo apk build --release
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # cargo-apk empaqueta el APK con la clave de debug de Android
+          # por defecto (~/.android/debug.keystore, se crea sola si no
+          # existe), suficiente para instalar/probar en un dispositivo o
+          # emulador. Para publicar en Play Store hay que firmar con una
+          # clave de release propia — no es lo que hace este workflow.
+          #
+          # Compilamos solo aarch64: cubre prácticamente todos los
+          # celulares/tablets Android reales de los últimos ~8 años. Se
+          # puede agregar `--target x86_64-linux-android` para probar en
+          # el emulador de Android Studio (que suele correr sobre x86_64).
           RUST_LOG: info
-        run: cargo apk build --lib --target aarch64-linux-android
+        run: cargo apk build --release --target aarch64-linux-android
 
       - name: Ubicar el APK generado
         id: locate
         run: |
-          APK_PATH=$(find target -name "*.apk" | head -n 1)
+          APK_PATH=$(find target -name "*.apk" -path "*release*" | head -n 1)
           if [ -z "$APK_PATH" ]; then
             echo "No se encontró ningún .apk bajo target/" >&2
             find target -maxdepth 4 -type d >&2
@@ -81,6 +88,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: voxel-engine-android
-          path: ${{ steps.locate.outputs.apk_path }}
+          path: voxel-engine/${{ steps.locate.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 14
