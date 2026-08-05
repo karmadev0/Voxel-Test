@@ -93,7 +93,7 @@ jobs:
           RUST_LOG: info
           CARGO_APK_RELEASE_KEYSTORE: ${{ github.workspace }}/release.keystore
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: android
-        run: cargo apk build --release --target aarch64-linux-android
+        run: cargo apk build --release --lib --target aarch64-linux-android
 
       - name: Ubicar el APK generado
         id: locate
@@ -114,3 +114,4 @@ jobs:
           path: ${{ steps.locate.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 14
+
