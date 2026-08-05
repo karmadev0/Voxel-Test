@@ -22,6 +22,15 @@ pub struct Camera {
     right: bool,
     up: bool,
     down: bool,
+
+    // Entrada analógica del joystick táctil (Android): strafe en x,
+    // adelante/atrás en y, cada uno en [-1, 1]. Se combina con las teclas
+    // WASD (que en desktop siguen mandando 0.0 acá) sumando ambos
+    // vectores y luego clampeando la magnitud a 1, así que un jugador con
+    // teclado+mouse conectado a una tablet Android, por ejemplo, puede
+    // usar ambos a la vez sin que se pisen.
+    touch_axis: (f32, f32),
+    touch_jump: bool,
 }
 
 impl Camera {
@@ -38,7 +47,26 @@ impl Camera {
             right: false,
             up: false,
             down: false,
+            touch_axis: (0.0, 0.0),
+            touch_jump: false,
         }
+    }
+
+    /// Actualiza el vector analógico de movimiento del joystick táctil.
+    /// `axis.0` es strafe (+derecha), `axis.1` es adelante/atrás (+adelante).
+    pub fn set_touch_move_axis(&mut self, axis: (f32, f32)) {
+        self.touch_axis = axis;
+    }
+
+    /// Mantiene o suelta el botón táctil de salto/subir.
+    pub fn set_touch_jump(&mut self, held: bool) {
+        self.touch_jump = held;
+    }
+
+    /// Aplica un delta de "mirada" venido de un drag táctil, con la misma
+    /// semántica que `process_mouse` (mismo signo, misma sensibilidad).
+    pub fn process_touch_look(&mut self, dx: f32, dy: f32) {
+        self.process_mouse(dx as f64, dy as f64);
     }
 
     pub fn process_key(&mut self, key: KeyCode, state: ElementState) {
@@ -69,6 +97,52 @@ impl Camera {
         .normalize()
     }
 
+    /// Dirección hacia donde mira la cámara, usada para el raycasting de
+    /// romper/colocar bloques.
+    pub fn view_direction(&self) -> Vec3 {
+        self.front()
+    }
+
+    /// Vector de movimiento horizontal (sin componente Y) según las teclas
+    /// WASD activas, relativo a hacia dónde mira la cámara. Usado por el
+    /// modo caminar (con gravedad/colisión), a diferencia de `update()`
+    /// que es el movimiento libre en 3D del modo vuelo.
+    pub fn horizontal_move_vector(&self, speed: f32) -> Vec3 {
+        let flat_front = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin()).normalize();
+        let right = flat_front.cross(Vec3::Y).normalize();
+
+        let mut dir = Vec3::ZERO;
+        if self.forward {
+            dir += flat_front;
+        }
+        if self.backward {
+            dir -= flat_front;
+        }
+        if self.right {
+            dir += right;
+        }
+        if self.left {
+            dir -= right;
+        }
+        dir += flat_front * self.touch_axis.1 + right * self.touch_axis.0;
+
+        if dir.length_squared() > 1.0 {
+            dir = dir.normalize();
+        }
+
+        if dir.length_squared() > 0.0 {
+            dir * speed
+        } else {
+            Vec3::ZERO
+        }
+    }
+
+    /// En modo caminar, la tecla Espacio (mapeada como "up" para el modo
+    /// vuelo) o el botón táctil de salto se reinterpretan como salto.
+    pub fn wants_jump(&self) -> bool {
+        self.up || self.touch_jump
+    }
+
     pub fn update(&mut self, dt: f32) {
         let front = self.front();
         let right = front.cross(Vec3::Y).normalize();
@@ -88,12 +162,16 @@ impl Camera {
         if self.left {
             self.position -= right * speed;
         }
-        if self.up {
+        if self.up || self.touch_jump {
             self.position += world_up * speed;
         }
         if self.down {
             self.position -= world_up * speed;
         }
+
+        // Joystick táctil: mismo tratamiento que WASD pero analógico
+        // (magnitud variable en vez de todo-o-nada).
+        self.position += front * self.touch_axis.1 * speed + right * self.touch_axis.0 * speed;
     }
 
     pub fn view_matrix(&self) -> Mat4 {

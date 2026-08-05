@@ -5,11 +5,13 @@
 /// caras adyacentes del mismo tipo en rectángulos grandes. Esto reduce
 /// drásticamente el número de triángulos que la GPU tiene que procesar.
 
+use serde::{Deserialize, Serialize};
+
 pub const CHUNK_SIZE_X: usize = 16;
 pub const CHUNK_SIZE_Y: usize = 64; // reducido respecto al original (256) para el primer entregable
 pub const CHUNK_SIZE_Z: usize = 16;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BlockType {
     Air,
     Grass,
@@ -34,6 +36,7 @@ impl BlockType {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Chunk {
     pub blocks: Vec<BlockType>, // indexado con index(x,y,z)
 }

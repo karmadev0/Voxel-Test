@@ -1,35 +1,83 @@
-# Voxel Engine — Fase 1
+# Voxel Engine — Fase 4
 
-Motor voxel propio en Rust. Esta es la **Fase 1**: mundo navegable con
-terreno generado proceduralmente, renderizado con `wgpu` sobre backend
-**OpenGL** (pensado para la Intel UHD Graphics 600 / Celeron N4000), usando
-**greedy meshing** desde el arranque para mantener el número de triángulos
-bajo control en hardware modesto.
+Motor voxel propio en Rust. **Fase 4**: streaming dinámico de chunks —
+el mundo ahora se carga/descarga según por dónde camina el jugador, en vez
+de quedar fijo al área generada al arrancar.
 
 ## Qué incluye esta entrega
 
-- Generación de terreno con ruido Perlin (colinas suaves, una capa de bioma:
-  pasto / tierra / piedra).
-- 81 chunks generados en paralelo con `rayon` (grilla de 9×9 alrededor del
-  origen, radio configurable en `main.rs` vía `RENDER_RADIUS`).
-- Greedy meshing real: cada chunk se malla fusionando caras adyacentes del
-  mismo tipo de bloque en rectángulos, no cubo por cubo.
-- Cámara de vuelo libre (WASD + mouse) sin colisión todavía.
-- CI en GitHub Actions que verifica que el proyecto compila en Linux en
-  cada push (no ejecuta el juego — un runner de Actions no tiene GPU con
-  salida de video, solo confirma que el código compila limpio).
+De Fases anteriores:
+- Terreno procedural, greedy meshing, backend OpenGL, generación paralela.
+- Contador de FPS en el título.
+- Romper/colocar bloques con raycasting DDA, hotbar simple (1/2/3).
 
-## Qué NO incluye todavía (a propósito, es la siguiente fase)
+Nuevo en Fase 3:
+- **Guardado/carga a disco** (`world.rs` + `chunk.rs` con `serde`/`bincode`):
+  al modificar un bloque, ese chunk queda marcado como "sucio". `F5` guarda
+  todos los chunks sucios en `world_save/chunk_X_Z.bin`. Al iniciar, cada
+  chunk primero intenta cargarse desde ahí antes de generarse de nuevo. El
+  mundo también se guarda automáticamente al cerrar la ventana.
+- **Física real** (`player.rs`, nuevo): gravedad + colisión AABB contra el
+  mundo, resuelta eje por eje (mover en X → corregir, mover en Y →
+  corregir, mover en Z → corregir). Ya no se atraviesan bloques.
+- **Modo Caminar / Vuelo** (tecla `F`): Caminar tiene gravedad, colisión y
+  salto; Vuelo es el modo libre de las fases anteriores, útil para
+  construir rápido o inspeccionar el mundo desde arriba. Arranca en modo
+  Caminar.
 
-- Colocar / romper bloques (Fase 2).
-- Colisión de la cámara con el terreno / gravedad (Fase 2).
-- Texturas (por ahora cada tipo de bloque es un color plano).
-- Guardado en disco / streaming de chunks (Fase 3).
+Nuevo en Fase 4:
+- **Streaming dinámico de chunks** (`world.rs`: `load_chunk` /
+  `unload_chunk`, `main.rs`: `update_chunk_streaming`): cada frame se
+  chequea en qué chunk está la cámara; si cambió de chunk desde el último
+  chequeo, se cargan (generan o leen de disco) los chunks que entraron al
+  radio `RENDER_RADIUS`, y se descargan los que quedaron afuera —
+  guardando primero si tenían cambios sin guardar, para no perder
+  ediciones al alejarte caminando.
+- Los chunks nuevos se generan y mallean **en paralelo con rayon**, igual
+  que en la carga inicial, para minimizar el hitch al cruzar de chunk.
+
+Nuevo en Fase 5:
+- **Streaming asincrónico** (`world.rs`: `ChunkLoader`, `lib.rs`:
+  `update_chunk_streaming` + `finalize_ready_chunks`): cruzar de chunk ya
+  no bloquea el frame. En vez de generar+mallear los chunks nuevos y
+  esperar a que terminen antes de seguir dibujando, cada chunk se manda a
+  un hilo de fondo (`rayon::spawn`) y el resultado vuelve por un
+  `mpsc::channel`. El hilo principal lo recoge de a lo sumo
+  `MAX_FINALIZED_CHUNKS_PER_FRAME` (2) por frame y recién ahí sube la
+  malla a la GPU — que es la única parte que tiene que pasar sí o sí por
+  el hilo principal (`wgpu::Device` no es seguro de usar desde cualquier
+  hilo para crear buffers en este setup). El resultado: cruzar de chunk
+  caminando ya no se siente como un microtrabón, aunque tarde uno o dos
+  frames más en terminar de aparecer el chunk nuevo (a cambio de no
+  trabar nada).
+
+## Controles
+
+| Acción | Tecla |
+|---|---|
+| Moverse | W A S D |
+| Saltar (modo Caminar) / Subir (modo Vuelo) | Espacio |
+| Bajar (solo modo Vuelo) | Shift izquierdo |
+| Mirar alrededor | Mouse (click primero para capturarlo) |
+| Romper bloque | Click izquierdo |
+| Colocar bloque | Click derecho |
+| Elegir bloque a colocar | 1 (pasto) / 2 (tierra) / 3 (piedra) |
+| Alternar Caminar / Vuelo | F |
+| Guardar mundo a disco | F5 |
+| Liberar el mouse | Esc |
+
+## Limitaciones conocidas (quedan para más adelante)
+
+- El mesh de cada chunk todavía no consulta los bloques reales del chunk
+  vecino en los bordes (los trata como aire) — puede haber alguna cara de
+  más dibujada en el límite entre chunks. No rompe nada, es una
+  optimización pendiente (Fase 5, todavía no implementada — ver más
+  abajo).
+- Colores planos por tipo de bloque, sin texturas todavía (Fase 5).
+- ~~El streaming carga/mallea los chunks nuevos de forma síncrona~~ →
+  resuelto: streaming asincrónico, ver sección Fase 5 más arriba.
 
 ## Cómo compilar
-
-Necesitás Rust instalado (`rustup.rs`). En Linux también necesitás las
-librerías de sistema para ventana + OpenGL:
 
 ```bash
 sudo apt-get install -y libx11-dev libxi-dev libxrandr-dev libxcursor-dev \
@@ -39,38 +87,85 @@ cargo build --release
 ./target/release/voxel-engine
 ```
 
-Si preferís compilar en una máquina más potente (o en GitHub Actions) y
-correrlo después en tu laptop: el CI de este repo ya sube el binario
-compilado como *artifact* descargable en cada push (pestaña **Actions** →
-el run correspondiente → **Artifacts** → `voxel-engine-linux-x86_64`).
-Como es cross-compiling x86_64 → x86_64 Linux, el binario debería correr
-directo en tu Celeron N4000 sin recompilar ahí, siempre que la libc del
-runner de Actions (Ubuntu) sea compatible con la tuya — si tu distro es muy
-distinta, puede hacer falta compilar directo en tu máquina o usar `musl`
-como target estático (lo dejamos pendiente si hace falta).
+O compilalo en GitHub Actions (`.github/workflows/desktop.yml`) y descargá
+el binario desde la pestaña Actions → Artifacts (hay una versión por
+plataforma: `voxel-engine-linux`, `voxel-engine-windows`,
+`voxel-engine-macos`).
 
-## Controles
+**Nota:** la carpeta `world_save/` (donde se guarda tu mundo) y `target/`
+no se suben al repo (ver `.gitignore`) — son datos locales de cada partida
+y archivos de compilación, no código fuente.
 
-| Acción | Tecla |
-|---|---|
-| Moverse | W A S D |
-| Subir / bajar | Espacio / Shift izquierdo |
-| Mirar alrededor | Mouse (click primero para capturarlo) |
-| Liberar el mouse | Esc |
+## Android
 
-## Nota honesta sobre esta primera entrega
+El motor corre en Android como app nativa (misma lógica que desktop,
+compartida en `lib.rs`), usando el backend Vulkan de wgpu. Diferencias
+respecto a desktop:
 
-El ecosistema de `wgpu` cambia de API con cierta frecuencia entre
-versiones. Este código está escrito contra `wgpu = "0.19"`; si al compilar
-`cargo` resuelve una versión más nueva y aparecen errores de tipos o de
-métodos renombrados, decime el mensaje de error exacto y lo ajusto — es
-normal en el primer intento con un ecosistema que evoluciona rápido, como
-mencioné antes de escribir el código.
+- **No hay teclado ni mouse**, así que el input se maneja por zonas
+  táctiles fijas, dibujadas en pantalla como overlay 2D semitransparente
+  (`src/ui_overlay.rs`; el hit-test en sí vive en `src/touch.rs`, que es
+  la fuente de verdad de las posiciones — el dibujo las reutiliza para no
+  desincronizarse nunca):
+  - Mitad izquierda de la pantalla: joystick de movimiento (aro + nub,
+    "flotante" — aparece donde tocás, no en un punto fijo).
+  - Mitad derecha, arrastrar: mirar (equivalente al mouse). Sin
+    indicador visual propio.
+  - Círculo entre ambos joysticks, abajo: saltar (se ilumina mientras se
+    mantiene apretado).
+  - Esquina inferior derecha: dos círculos — verde coloca bloque, rojo
+    rompe.
+  - Esquina superior derecha: tres cuadrados = hotbar (1/2/3, igual que
+    las teclas Digit1-3 en desktop), pintados con el mismo color que el
+    bloque que seleccionan; el activo tiene borde blanco. No hay texto
+    (todavía no hay pase de fuentes en el engine).
+- Vulkan es obligatorio (sin fallback a GLES por ahora).
+- El guardado/carga a disco (`world_save/`) usa el almacenamiento interno
+  de la app en vez de una ruta relativa arbitraria — gestionado por
+  Android automáticamente, no requiere permisos de almacenamiento.
 
-## Próximos pasos (Fase 2)
+### Compilar el APK localmente
 
-- Raycasting (DDA) para seleccionar el bloque apuntado.
-- Colocar / romper bloques con regeneración incremental del mesh del chunk
-  afectado.
-- Atlas de texturas real en vez de colores planos.
-- Colisión AABB de la cámara contra el terreno + gravedad.
+```bash
+rustup target add aarch64-linux-android
+cargo install cargo-apk --locked
+# Necesitás el NDK instalado y la variable ANDROID_NDK_HOME apuntando a él.
+cargo apk build --release --target aarch64-linux-android
+# El APK queda bajo target/release/apk/ (o target/<target-triple>/release/apk/)
+```
+
+Para probarlo con un dispositivo conectado por USB (con depuración USB
+activada): `cargo apk run --release --target aarch64-linux-android`.
+
+### Compilar el APK en GitHub Actions (sin instalar nada localmente)
+
+El workflow `.github/workflows/android.yml` compila el APK en cada push a
+`main` (o a mano desde la pestaña **Actions → Build Android APK → Run
+workflow**) y lo deja descargable como artifact durante 14 días.
+
+**Importante sobre las rutas:** el workflow asume que la raíz del repo de
+GitHub contiene una carpeta `voxel-engine/` (igual que este zip). Si en tu
+repo `Cargo.toml` está directamente en la raíz (sin esa carpeta
+intermedia), sacá `voxel-engine` de `working-directory` en el workflow y
+de la ruta del `path:` en el paso de `upload-artifact`.
+
+El APK se firma con la clave de debug de Android (se genera sola la
+primera vez) — instalable y jugable en cualquier dispositivo/emulador,
+pero no apta para publicar en Play Store sin volver a firmarla con una
+clave de release propia.
+
+## Fase 5
+
+## Próximos pasos (Fase 5, en progreso)
+
+- [x] Streaming asincrónico (generar en hilo de fondo, sin microtrabones).
+- [x] Overlay 2D en Android: joystick, botones de romper/colocar/saltar y
+      hotbar, ahora visibles en pantalla (antes eran zonas invisibles).
+      Sin texto (no hay pase de fuentes todavía): la hotbar usa el mismo
+      color que el bloque que selecciona, y el bloque activo se marca con
+      un borde blanco. Ver `src/ui_overlay.rs`.
+- [ ] Culling consciente de chunks vecinos en el greedy meshing.
+- [ ] Cuevas 3D e iluminación por propagación.
+- [ ] Atlas de texturas real en vez de colores planos.
+
+
