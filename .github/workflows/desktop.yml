@@ -15,6 +15,14 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      build_tag:
+        description: >-
+          Etiqueta de build para el overlay en pantalla (ej.
+          voxel-engine-build-35-06082026). Si se deja vacío, se genera
+          automáticamente a partir de la fecha y el commit.
+        required: false
+        type: string
 
 jobs:
   build-desktop:
@@ -65,9 +73,43 @@ jobs:
             libxcursor-dev libxinerama-dev libgl1-mesa-dev libegl1-mesa-dev \
             libgtk-3-dev pkg-config
 
+      # Si se disparó a mano con un build_tag, se usa ese. Si no (push
+      # automático a main, o el input quedó vacío), se arma uno solo con
+      # la fecha del run, los primeros 7 caracteres del commit, y las
+      # primeras ~30 letras del mensaje de commit (saneado: minúsculas,
+      # espacios/símbolos raros pasados a guiones), así el overlay en
+      # pantalla siempre muestra algo identificable en vez de quedarse
+      # en el default "voxel-engine-dev" del build.rs.
+      - name: Resolver BUILD_TAG
+        id: build_tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.build_tag }}" ]; then
+            TAG="${{ inputs.build_tag }}"
+          else
+            # Solo el "subject" (primera línea) del commit, por si el
+            # mensaje tiene cuerpo de varias líneas.
+            RAW_MSG="$(git log -1 --format=%s)"
+            # Saneamos: minúsculas, cualquier cosa que no sea a-z/0-9 pasa
+            # a guión, guiones repetidos se colapsan, y se recorta
+            # guion inicial/final que pueda quedar tras el reemplazo.
+            SAFE_MSG="$(echo "$RAW_MSG" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+            # Truncamos a 30 caracteres del mensaje ya saneado.
+            SHORT_MSG="${SAFE_MSG:0:30}"
+            SHORT_MSG="$(echo "$SHORT_MSG" | sed -E 's/-+$//')"
+            TAG="voxel-engine-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+            if [ -n "$SHORT_MSG" ]; then
+              TAG="${TAG}-${SHORT_MSG}"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "BUILD_TAG resuelto: $TAG"
+
       # Solo el binario, no la lib cdylib (esa es para Android) — evita
       # compilar un .so/.dll que en desktop no se usa para nada.
       - name: cargo build --release
+        env:
+          BUILD_TAG: ${{ steps.build_tag.outputs.tag }}
         run: cargo build --release --bin voxel-engine
 
       - name: Subir binario como artifact

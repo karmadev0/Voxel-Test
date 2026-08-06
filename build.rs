@@ -35,6 +35,18 @@ const TILE_PX: u32 = 16;
 const FACES: [&str; 6] = ["top", "bottom", "north", "south", "east", "west"];
 
 fn main() {
+    // --- Etiqueta de build para el overlay en pantalla ---
+    // Se puede fijar al compilar con `BUILD_TAG=voxel-engine-build-35-06082026
+    // cargo build`. Si no se define, usamos un default que igual sirve para
+    // distinguir builds locales de desarrollo. `rustc-env` deja la variable
+    // disponible en tiempo de compilación vía `env!("VOXEL_BUILD_TAG")` en
+    // el código Rust (a diferencia de `std::env::var` en runtime, que no
+    // vería nada porque la env var del build no persiste al ejecutar el
+    // binario final).
+    println!("cargo:rerun-if-env-changed=BUILD_TAG");
+    let build_tag = std::env::var("BUILD_TAG").unwrap_or_else(|_| "voxel-engine-dev".to_string());
+    println!("cargo:rustc-env=VOXEL_BUILD_TAG={}", build_tag);
+
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR no está seteado (¿corriendo fuera de cargo?)");
     let textures_dir = Path::new(&manifest_dir).join("assets/textures");

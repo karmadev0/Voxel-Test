@@ -168,6 +168,10 @@ struct State {
     // borde de la capa de nubes. Prendido/apagado desde el panel de
     // configuración, fila "NIEBLA".
     show_fog: bool,
+    // Si se dibuja el overlay de información de build (etiqueta de build
+    // + plataforma) en la esquina superior izquierda. Prendido/apagado
+    // desde el panel de configuración, fila "INFO DE BUILD".
+    show_build_info: bool,
 
     /// Pantalla activa: Playing o Settings (pausa).
     game_screen: GameScreen,
@@ -239,6 +243,7 @@ impl State {
             show_fps: true,
             show_clouds: true,
             show_fog: true,
+            show_build_info: true,
             game_screen: GameScreen::Playing,
             current_player_chunk: (0, 0),
             render_radius: DEFAULT_RENDER_RADIUS,
@@ -635,6 +640,7 @@ impl State {
                 self.render_radius,
                 self.show_clouds,
                 self.show_fog,
+                self.show_build_info,
             )
         } else {
             let mut verts = ui_overlay::build_crosshair(self.render.size);
@@ -648,6 +654,16 @@ impl State {
             // Contador de FPS en la esquina superior derecha.
             if self.show_fps {
                 verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.render.size));
+            }
+            // Info de build (etiqueta + plataforma) en la esquina
+            // superior izquierda. `VOXEL_BUILD_TAG` se fija en
+            // compilación (ver build.rs); por defecto es
+            // "voxel-engine-dev" si no se pasó `BUILD_TAG=...`.
+            if self.show_build_info {
+                verts.extend(ui_overlay::build_build_info_overlay(
+                    self.render.size,
+                    env!("VOXEL_BUILD_TAG"),
+                ));
             }
             verts
         };
@@ -1180,6 +1196,7 @@ impl ApplicationHandler for App {
                             state.walk_mode,
                             state.show_clouds,
                             state.show_fog,
+                            state.show_build_info,
                         )
                     } else {
                         // En juego: procesamos controles táctiles normales.
@@ -1228,6 +1245,9 @@ impl ApplicationHandler for App {
                             }
                             TouchAction::ToggleFog => {
                                 state.show_fog = !state.show_fog;
+                            }
+                            TouchAction::ToggleBuildInfo => {
+                                state.show_build_info = !state.show_build_info;
                             }
                         }
                     }

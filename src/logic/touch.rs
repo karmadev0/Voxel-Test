@@ -101,6 +101,10 @@ pub enum TouchAction {
     /// junto con el resto del estado de `render_radius`.
     DecreaseRenderRadius,
     IncreaseRenderRadius,
+    /// Prender/apagar el overlay de información de build (etiqueta de
+    /// build + plataforma, esquina superior izquierda). Fila "INFO DE
+    /// BUILD" en la pantalla de config.
+    ToggleBuildInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +212,13 @@ impl TouchController {
     /// de la de nubes.
     pub(crate) fn rect_settings_fog_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
         let (x, y, w, h) = Self::rect_settings_clouds_row(size);
+        (x, y + h + 14.0, w, h)
+    }
+
+    /// Fila del toggle de info de build en la pantalla de config, justo
+    /// debajo de la de niebla.
+    pub(crate) fn rect_settings_build_info_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let (x, y, w, h) = Self::rect_settings_fog_row(size);
         (x, y + h + 14.0, w, h)
     }
 
@@ -385,6 +396,7 @@ impl TouchController {
         walk_mode: bool,
         show_clouds: bool,
         show_fog: bool,
+        show_build_info: bool,
     ) -> Option<TouchAction> {
         if touch.phase != TouchPhase::Started {
             return None;
@@ -423,13 +435,18 @@ impl TouchController {
             return Some(TouchAction::ToggleFog);
         }
 
-        // `show_fps`/`walk_mode`/`show_clouds`/`show_fog` no hacen falta
-        // para el hit-testing en sí (las filas están en posiciones fijas
-        // sin importar el estado ON/OFF de cada toggle) — se reciben acá
-        // solo para mantener la firma simétrica con `build_settings_screen`
-        // en ui_overlay.rs, que sí los necesita para dibujar el estado
-        // actual de cada switch.
-        let _ = (show_fps, walk_mode, show_clouds, show_fog);
+        let build_info_row = Self::rect_settings_build_info_row(size);
+        if Self::point_in_rect(pos, build_info_row) {
+            return Some(TouchAction::ToggleBuildInfo);
+        }
+
+        // `show_fps`/`walk_mode`/`show_clouds`/`show_fog`/`show_build_info`
+        // no hacen falta para el hit-testing en sí (las filas están en
+        // posiciones fijas sin importar el estado ON/OFF de cada toggle)
+        // — se reciben acá solo para mantener la firma simétrica con
+        // `build_settings_screen` en ui_overlay.rs, que sí los necesita
+        // para dibujar el estado actual de cada switch.
+        let _ = (show_fps, walk_mode, show_clouds, show_fog, show_build_info);
 
         None
     }

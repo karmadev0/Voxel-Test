@@ -403,6 +403,66 @@ pub fn build_crosshair(size: PhysicalSize<u32>) -> Vec<UiVertex> {
 }
 
 // ============================================================
+//  OVERLAY DE INFO DE BUILD (esquina superior izquierda)
+// ============================================================
+// Muestra la etiqueta de build (fijada en compilación vía
+// `BUILD_TAG=... cargo build`, ver build.rs) junto con la plataforma
+// actual (WINDOWS/LINUX/ANDROID/MACOS). Toggleable desde el panel de
+// configuración, fila "INFO DE BUILD".
+const BUILD_INFO_MARGIN: f64 = 16.0;
+const BUILD_INFO_PADDING: f64 = 8.0;
+const BUILD_INFO_LINE_GAP: f64 = 4.0;
+
+/// Nombre de la plataforma actual, en mayúsculas, listo para dibujar
+/// con la fuente bitmap (que solo soporta A-Z/0-9/algunos símbolos).
+fn platform_label() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "WINDOWS",
+        "linux" => "LINUX",
+        "android" => "ANDROID",
+        "macos" => "MACOS",
+        "ios" => "IOS",
+        other => {
+            // Fallback genérico para plataformas no listadas arriba;
+            // no debería pasar en los targets que soporta el proyecto,
+            // pero evita un panic si `main()` corre en algo inesperado.
+            if other.is_empty() { "DESCONOCIDO" } else { "OTRO" }
+        }
+    }
+}
+
+/// Construye el texto de build+plataforma para la esquina superior
+/// izquierda. `build_tag` viene de `env!("VOXEL_BUILD_TAG")` en
+/// lib.rs (fijado en compilación, ver build.rs).
+pub fn build_build_info_overlay(size: PhysicalSize<u32>, build_tag: &str) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(128);
+
+    let tag_upper = build_tag.to_ascii_uppercase();
+    let platform = platform_label();
+
+    let line1_w = text_width(&tag_upper);
+    let line2_w = text_width(platform);
+    let panel_w = line1_w.max(line2_w) + BUILD_INFO_PADDING * 2.0;
+    let panel_h = FONT_CELL_H * 2.0 + BUILD_INFO_LINE_GAP + BUILD_INFO_PADDING * 2.0;
+
+    let panel_x = BUILD_INFO_MARGIN;
+    let panel_y = BUILD_INFO_MARGIN;
+
+    // Fondo semitransparente para que el texto se lea sobre cualquier
+    // paisaje (cielo claro, follaje, etc.).
+    push_quad(&mut v, size, (panel_x, panel_y, panel_w, panel_h), [0.0, 0.0, 0.0, 0.45]);
+
+    let text_x = panel_x + BUILD_INFO_PADDING;
+    let line1_y = panel_y + BUILD_INFO_PADDING;
+    let line2_y = line1_y + FONT_CELL_H + BUILD_INFO_LINE_GAP;
+
+    push_text(&mut v, size, &tag_upper, text_x, line1_y, [0.85, 0.9, 1.0, 0.95]);
+    push_text(&mut v, size, platform, text_x, line2_y, [0.6, 0.75, 0.95, 0.85]);
+
+    v
+}
+
+// ============================================================
 //  OVERLAY DE JUEGO (joystick, botones, hotbar, botón config)
 // ============================================================
 const JOYSTICK_VISUAL_RADIUS: f64 = 70.0;
@@ -468,6 +528,7 @@ pub fn build_settings_screen(
     render_radius: i32,
     show_clouds: bool,
     show_fog: bool,
+    show_build_info: bool,
 ) -> Vec<UiVertex> {
     let mut v = Vec::with_capacity(512);
     let sw = size.width as f64;
@@ -574,6 +635,19 @@ pub fn build_settings_screen(
     push_text(&mut v, size, state5, state5_x, label5_y, state_color5);
 
     push_quad(&mut v, size, (row5.0, row5.1 + row5.3 + 4.0, row5.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+
+    // --- Fila 6: "INFO DE BUILD" con toggle ---
+    let row6 = TouchController::rect_settings_build_info_row(size);
+    let label6_y = row6.1 + (row6.3 - FONT_CELL_H) * 0.5;
+    push_text(&mut v, size, "INFO DE BUILD", row6.0, label6_y, [0.85, 0.88, 0.95, 1.0]);
+    let switch6 = TouchController::rect_row_switch(row6);
+    push_toggle_switch(&mut v, size, switch6, show_build_info);
+    let state6 = if show_build_info { "ON" } else { "OFF" };
+    let state_color6: [f32; 4] = if show_build_info { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
+    let state6_x = switch6.0 - text_width(state6) - 12.0;
+    push_text(&mut v, size, state6, state6_x, label6_y, state_color6);
+
+    push_quad(&mut v, size, (row6.0, row6.1 + row6.3 + 4.0, row6.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 
     // --- Botón "< VOLVER" arriba izquierda ---
     let back_rect = TouchController::rect_back_button(size);

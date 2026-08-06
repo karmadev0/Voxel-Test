@@ -14,6 +14,14 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      build_tag:
+        description: >-
+          Etiqueta de build para el overlay en pantalla (ej.
+          voxel-engine-build-35-06082026). Si se deja vacío, se genera
+          automáticamente a partir de la fecha y el commit.
+        required: false
+        type: string
 
 env:
   # Runner ubuntu-latest ya trae el Android SDK (aapt, apksigner,
@@ -78,6 +86,29 @@ jobs:
       - name: Instalar cargo-apk
         run: cargo install cargo-apk --locked
 
+      # Si se disparó a mano con un build_tag, se usa ese. Si no (push
+      # automático a main, o el input quedó vacío), se arma uno solo con
+      # la fecha del run, los primeros 7 caracteres del commit, y las
+      # primeras ~30 letras del mensaje de commit (saneado: minúsculas,
+      # espacios/símbolos raros pasados a guiones).
+      - name: Resolver BUILD_TAG
+        id: build_tag
+        run: |
+          if [ -n "${{ inputs.build_tag }}" ]; then
+            TAG="${{ inputs.build_tag }}"
+          else
+            RAW_MSG="$(git log -1 --format=%s)"
+            SAFE_MSG="$(echo "$RAW_MSG" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+            SHORT_MSG="${SAFE_MSG:0:30}"
+            SHORT_MSG="$(echo "$SHORT_MSG" | sed -E 's/-+$//')"
+            TAG="voxel-engine-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+            if [ -n "$SHORT_MSG" ]; then
+              TAG="${TAG}-${SHORT_MSG}"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "BUILD_TAG resuelto: $TAG"
+
       - name: cargo apk build --release
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
@@ -92,6 +123,7 @@ jobs:
           # puede agregar `--target x86_64-linux-android` para probar en
           # el emulador de Android Studio (que suele correr sobre x86_64).
           RUST_LOG: info
+          BUILD_TAG: ${{ steps.build_tag.outputs.tag }}
         run: cargo apk build --release --lib --target aarch64-linux-android
 
       - name: Ubicar el APK generado
