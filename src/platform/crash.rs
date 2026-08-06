@@ -178,6 +178,32 @@ pub fn last_crash() -> Option<(String, String, Option<PathBuf>)> {
         .map(|r| (r.short_message.clone(), r.full_text.clone(), r.file_path.clone()))
 }
 
+/// Copia cualquier texto al portapapeles del sistema — versión genérica
+/// de `copy_last_crash_to_clipboard`, usada por el panel de debug (F3,
+/// ver logic/ui_overlay.rs) para copiar su snapshot (posición, chunk,
+/// bloque apuntado, etc.), que no tiene nada que ver con un crash.
+#[cfg(not(target_os = "android"))]
+pub fn copy_text_to_clipboard(text: &str) -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.set_text(text.to_string()).is_ok(),
+        Err(e) => {
+            log::warn!("No se pudo abrir el portapapeles: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn copy_text_to_clipboard(text: &str) -> bool {
+    match copy_to_clipboard_android(text) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("No se pudo copiar texto al portapapeles (Android): {}", e);
+            false
+        }
+    }
+}
+
 /// Copia el reporte completo del último crash al portapapeles del
 /// sistema. Se usa cuando el usuario aprieta C en desktop, o toca la
 /// pantalla en Android, mientras se ve la pantalla de crash.
@@ -186,13 +212,7 @@ pub fn copy_last_crash_to_clipboard() -> bool {
     let Some((_, full_text, _)) = last_crash() else {
         return false;
     };
-    match arboard::Clipboard::new() {
-        Ok(mut cb) => cb.set_text(full_text).is_ok(),
-        Err(e) => {
-            log::warn!("No se pudo abrir el portapapeles: {}", e);
-            false
-        }
-    }
+    copy_text_to_clipboard(&full_text)
 }
 
 /// Versión Android de lo mismo, vía JNI contra
@@ -206,13 +226,7 @@ pub fn copy_last_crash_to_clipboard() -> bool {
     let Some((_, full_text, _)) = last_crash() else {
         return false;
     };
-    match copy_to_clipboard_android(&full_text) {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("No se pudo copiar el log al portapapeles (Android): {}", e);
-            false
-        }
-    }
+    copy_text_to_clipboard(&full_text)
 }
 
 #[cfg(target_os = "android")]

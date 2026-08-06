@@ -83,7 +83,12 @@ pub enum TouchAction {
     /// El jugador tocó "Volver" en la pantalla de config → volver al juego.
     CloseSettings,
     ToggleFps,
-    ToggleWalkMode,
+    /// Selección de modo de juego desde el panel de ajustes: 0 =
+    /// Supervivencia, 1 = Creativo, 2 = Espectador (mismo índice que
+    /// `TouchController::rect_mode_option`). Solo se dispara desde
+    /// `on_touch_settings` — no hay forma de cambiar de modo durante el
+    /// juego en sí, a propósito (ver `State::set_game_mode` en lib.rs).
+    SetGameMode(usize),
     /// Prender/apagar el dibujado de la capa de nubes (fila "NUBES" en
     /// la pantalla de config). No afecta el streaming de chunks ni nada
     /// más, solo si el draw call de `clouds_pipeline` se ejecuta o no.
@@ -105,6 +110,17 @@ pub enum TouchAction {
     /// build + plataforma, esquina superior izquierda). Fila "INFO DE
     /// BUILD" en la pantalla de config.
     ToggleBuildInfo,
+    /// Prender/apagar el panel de debug (posición, chunk, bloque
+    /// apuntado, modo, fps, ruta de log). Fila "PANEL DE DEBUG (F3)" en
+    /// la pantalla de config; también togglea con la tecla F3 en
+    /// desktop (ver lib.rs), de ahí el nombre entre paréntesis en la
+    /// etiqueta de la fila.
+    ToggleDebugPanel,
+    /// El jugador tocó el botón "COPIAR" dentro del panel de debug (solo
+    /// llega desde `on_touch_game`, no desde `on_touch_settings`: el
+    /// panel de debug se dibuja encima del juego, no de la pantalla de
+    /// ajustes).
+    CopyDebugSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,10 +204,30 @@ impl TouchController {
         (row_x, row_y, row_w, 52.0)
     }
 
-    /// Fila del toggle modo Caminar en la pantalla de config.
+    /// Fila del selector de modo de juego (Supervivencia/Creativo/
+    /// Espectador) en la pantalla de config. Más alta que una fila
+    /// normal (1.8x) porque tiene una etiqueta propia ("MODO DE JUEGO")
+    /// arriba y los 3 botones abajo, en vez de compartir una sola línea
+    /// con el texto como las demás filas. El nombre interno quedó como
+    /// "walk_row" por compatibilidad con el resto de filas que se
+    /// posicionan en cadena relativa a esta — antes acá vivía un simple
+    /// switch ON/OFF "modo Caminar".
     pub(crate) fn rect_settings_walk_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
         let (x, y, w, h) = Self::rect_settings_fps_row(size);
-        (x, y + h + 14.0, w, h)
+        (x, y + h + 14.0 + h * 0.8, w, h)
+    }
+
+    /// Sub-rectángulo de una de las 3 opciones del selector de modo,
+    /// dentro de la fila de modo (`rect_settings_walk_row`). `index` es
+    /// 0=Supervivencia, 1=Creativo, 2=Espectador — mismo orden en el que
+    /// se dibujan (ver `build_settings_screen`) y en el que
+    /// `on_touch_settings` hace el hit-test.
+    pub(crate) fn rect_mode_option(size: PhysicalSize<u32>, index: usize) -> (f64, f64, f64, f64) {
+        let (rx, ry, rw, rh) = Self::rect_settings_walk_row(size);
+        let gap = 8.0;
+        let option_w = (rw - gap * 2.0) / 3.0;
+        let x = rx + index as f64 * (option_w + gap);
+        (x, ry, option_w, rh)
     }
 
     /// Fila del stepper de distancia de chunks en la pantalla de config,
@@ -219,6 +255,13 @@ impl TouchController {
     /// debajo de la de niebla.
     pub(crate) fn rect_settings_build_info_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
         let (x, y, w, h) = Self::rect_settings_fog_row(size);
+        (x, y + h + 14.0, w, h)
+    }
+
+    /// Fila del toggle del panel de debug (F3) en la pantalla de config,
+    /// justo debajo de la de info de build.
+    pub(crate) fn rect_settings_debug_panel_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let (x, y, w, h) = Self::rect_settings_build_info_row(size);
         (x, y + h + 14.0, w, h)
     }
 
@@ -294,11 +337,21 @@ impl TouchController {
     }
 
     /// Procesa un evento táctil durante el juego (pantalla de juego activa).
-    pub fn on_touch_game(&mut self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+    pub fn on_touch_game(
+        &mut self,
+        touch: Touch,
+        size: PhysicalSize<u32>,
+        debug_panel_copy_rect: Option<(f64, f64, f64, f64)>,
+    ) -> Option<TouchAction> {
         let pos = (touch.location.x, touch.location.y);
 
         match touch.phase {
             TouchPhase::Started => {
+                if let Some(rect) = debug_panel_copy_rect {
+                    if Self::point_in_rect(pos, rect) {
+                        return Some(TouchAction::CopyDebugSnapshot);
+                    }
+                }
                 if Self::point_in_rect(pos, Self::rect_settings(size)) {
                     // Soltar drags activos para no dejar el joystick pegado.
                     self.drags.clear();
@@ -393,10 +446,11 @@ impl TouchController {
         touch: Touch,
         size: PhysicalSize<u32>,
         show_fps: bool,
-        walk_mode: bool,
+        game_mode_index: usize,
         show_clouds: bool,
         show_fog: bool,
         show_build_info: bool,
+        show_debug_panel: bool,
     ) -> Option<TouchAction> {
         if touch.phase != TouchPhase::Started {
             return None;
@@ -412,9 +466,12 @@ impl TouchController {
             return Some(TouchAction::ToggleFps);
         }
 
-        let walk_row = Self::rect_settings_walk_row(size);
-        if Self::point_in_rect(pos, walk_row) {
-            return Some(TouchAction::ToggleWalkMode);
+        // Selector de modo: 3 sub-botones dentro de la misma fila
+        // (Supervivencia/Creativo/Espectador, índices 0/1/2).
+        for i in 0..3 {
+            if Self::point_in_rect(pos, Self::rect_mode_option(size, i)) {
+                return Some(TouchAction::SetGameMode(i));
+            }
         }
 
         let render_distance_row = Self::rect_settings_render_distance_row(size);
@@ -440,13 +497,19 @@ impl TouchController {
             return Some(TouchAction::ToggleBuildInfo);
         }
 
-        // `show_fps`/`walk_mode`/`show_clouds`/`show_fog`/`show_build_info`
-        // no hacen falta para el hit-testing en sí (las filas están en
-        // posiciones fijas sin importar el estado ON/OFF de cada toggle)
-        // — se reciben acá solo para mantener la firma simétrica con
+        let debug_panel_row = Self::rect_settings_debug_panel_row(size);
+        if Self::point_in_rect(pos, debug_panel_row) {
+            return Some(TouchAction::ToggleDebugPanel);
+        }
+
+        // `show_fps`/`game_mode_index`/`show_clouds`/`show_fog`/
+        // `show_build_info`/`show_debug_panel` no hacen falta para el
+        // hit-testing en sí (las filas están en posiciones fijas sin
+        // importar el estado actual de cada control) — se reciben acá
+        // solo para mantener la firma simétrica con
         // `build_settings_screen` en ui_overlay.rs, que sí los necesita
-        // para dibujar el estado actual de cada switch.
-        let _ = (show_fps, walk_mode, show_clouds, show_fog, show_build_info);
+        // para dibujar el estado actual de cada control.
+        let _ = (show_fps, game_mode_index, show_clouds, show_fog, show_build_info, show_debug_panel);
 
         None
     }

@@ -260,6 +260,11 @@ impl ChunkLoader {
 pub struct RaycastHit {
     /// Posición (en coordenadas de bloque) del bloque sólido golpeado.
     pub block_pos: (i32, i32, i32),
+    /// Tipo de bloque golpeado (para mostrar "qué se está detectando" en
+    /// el panel de debug, ver ui_overlay.rs). Nunca es `Air`: solo se
+    /// llega a construir un `RaycastHit` cuando `get_block(...).is_solid()`
+    /// dio `true` más abajo.
+    pub block_type: BlockType,
     /// Posición del bloque de aire justo antes del impacto — ahí es donde
     /// se coloca un bloque nuevo si el jugador hace click derecho.
     pub place_pos: (i32, i32, i32),
@@ -312,9 +317,11 @@ pub fn raycast(world: &World, origin: Vec3, direction: Vec3, max_distance: f32) 
     let mut traveled = 0.0;
 
     while traveled < max_distance {
-        if world.get_block(x, y, z).is_solid() {
+        let block = world.get_block(x, y, z);
+        if block.is_solid() {
             return Some(RaycastHit {
                 block_pos: (x, y, z),
+                block_type: block,
                 place_pos: last_empty,
             });
         }

@@ -143,6 +143,30 @@ impl Camera {
         self.up || self.touch_jump
     }
 
+    /// Vector de movimiento libre en 3D (horizontal + vertical) según las
+    /// teclas activas, para el modo Creativo (vuelo CON colisión, ver
+    /// `Player::fly_update`). A diferencia de `update()` (vuelo de
+    /// Espectador, sin colisión, que mueve `self.position` directo) esta
+    /// función solo devuelve la dirección/velocidad deseada; quien la
+    /// llama es responsable de resolver colisiones con ella.
+    pub fn free_move_vector(&self, speed: f32) -> Vec3 {
+        let mut dir = self.horizontal_move_vector(1.0);
+        if self.up || self.touch_jump {
+            dir += Vec3::Y;
+        }
+        if self.down {
+            dir -= Vec3::Y;
+        }
+        if dir.length_squared() > 1.0 {
+            dir = dir.normalize();
+        }
+        if dir.length_squared() > 0.0 {
+            dir * speed
+        } else {
+            Vec3::ZERO
+        }
+    }
+
     pub fn update(&mut self, dt: f32) {
         let front = self.front();
         let right = front.cross(Vec3::Y).normalize();

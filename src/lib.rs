@@ -54,6 +54,87 @@ enum GameScreen {
     Settings,
 }
 
+/// Modo de juego, igual que en Minecraft:
+///
+/// - `Survival` (antes "modo caminar"): gravedad + colisión normal
+///   contra el mundo, vía `Player::update`. Se puede construir encima o
+///   debajo de uno mismo sin restricción — si te encierras, te
+///   encierras: hay que cavar para salir. Sin auto-rescate.
+/// - `Creative`: vuelo libre (sin gravedad) pero CON colisión contra el
+///   mundo, vía `Player::fly_update` — no se atraviesan bloques
+///   caminando/volando. No se puede colocar un bloque que se solape con
+///   el propio jugador (a diferencia de Survival), y si de todos modos
+///   queda atrapado (por streaming de chunks, un bug, etc.) el
+///   auto-rescate lo saca al aire libre más cercano.
+/// - `Spectator`: vuelo libre sin colisión alguna (noclip), vía
+///   `Camera::update` — atraviesa cualquier bloque. Nunca puede quedar
+///   atrapado, así que ni el bloqueo de colocación ni el auto-rescate
+///   aplican acá.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameMode {
+    Survival,
+    Creative,
+    Spectator,
+}
+
+impl GameMode {
+    /// Nombre para mostrar en overlays de texto (panel de debug, mensaje
+    /// al cambiar de modo) — ya en mayúsculas, para la fuente bitmap.
+    fn label(self) -> &'static str {
+        match self {
+            GameMode::Survival => "SUPERVIVENCIA",
+            GameMode::Creative => "CREATIVO",
+            GameMode::Spectator => "ESPECTADOR",
+        }
+    }
+
+    /// Si en este modo el jugador tiene colisión contra el mundo
+    /// (Survival y Creative sí, Spectator no).
+    #[allow(dead_code)] // se usará en el paso 5 (auto-rescate)
+    fn has_collision(self) -> bool {
+        !matches!(self, GameMode::Spectator)
+    }
+
+    /// Si en este modo NO se puede colocar un bloque que se solape con
+    /// la propia caja de colisión del jugador (ver `handle_click`).
+    /// Solo Creative — Survival permite encerrarse (como Minecraft real,
+    /// hay que cavar para salir) y Spectator no tiene colisión, así que
+    /// la pregunta ni aplica.
+    fn blocks_self_placement(self) -> bool {
+        matches!(self, GameMode::Creative)
+    }
+
+    /// Si en este modo aplica el auto-rescate al aire libre más cercano
+    /// cuando el jugador queda atrapado (paso 5). Solo Creative.
+    fn auto_rescue(self) -> bool {
+        matches!(self, GameMode::Creative)
+    }
+
+    /// Índice 0/1/2 (Survival/Creative/Spectator) para el selector de 3
+    /// opciones del panel de ajustes (ver logic/ui_overlay.rs y
+    /// logic/touch.rs, que no conocen el tipo `GameMode` en sí, solo
+    /// índices — así ese código no depende de un tipo interno de lib.rs).
+    fn index(self) -> usize {
+        match self {
+            GameMode::Survival => 0,
+            GameMode::Creative => 1,
+            GameMode::Spectator => 2,
+        }
+    }
+
+    /// Inverso de `index()`: arma el `GameMode` a partir del índice que
+    /// llega desde `TouchAction::SetGameMode`. Cualquier índice fuera de
+    /// 0..3 (no debería pasar nunca, ya que `rect_mode_option` solo
+    /// genera 0/1/2) cae en Survival por seguridad.
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => GameMode::Creative,
+            2 => GameMode::Spectator,
+            _ => GameMode::Survival,
+        }
+    }
+}
+
 /// Lo que un hilo de fondo manda de vuelta al terminar de generar/cargar
 /// un chunk y mallearlo: coordenadas, el chunk (para insertarlo en
 /// `World`) y su malla ya calculada en CPU (`MeshData`) — lo único que
@@ -111,7 +192,7 @@ struct State {
     world: World,
     camera: Camera,
     player: Player,
-    walk_mode: bool,
+    game_mode: GameMode,
     selected_block: BlockType,
 
     mouse_captured: bool,
@@ -172,6 +253,20 @@ struct State {
     // + plataforma) en la esquina superior izquierda. Prendido/apagado
     // desde el panel de configuración, fila "INFO DE BUILD".
     show_build_info: bool,
+    // Si se dibuja el panel de debug (posición, chunk, bloque apuntado,
+    // modo, fps, ruta de log). Toggleable con F3 (desktop) o desde el
+    // panel de configuración, fila "PANEL DE DEBUG (F3)".
+    show_debug_panel: bool,
+    // Hasta cuándo mostrar "COPIADO!" en el botón del panel de debug en
+    // vez de "COPIAR", tras un copiado exitoso. `None` = sin flash activo.
+    debug_copy_flash_until: Option<Instant>,
+    // Cooldown del auto-rescate (paso 5): evita re-disparar un
+    // teletransporte en frames consecutivos mientras la posición
+    // rescatada termina de asentarse (por ejemplo si el punto elegido
+    // resulta estar muy pegado a otro sólido y el jugador vuelve a
+    // "tocar" algo un par de frames después). `None` = sin cooldown
+    // activo, se puede rescatar de nuevo apenas haga falta.
+    rescue_cooldown_until: Option<Instant>,
 
     /// Pantalla activa: Playing o Settings (pausa).
     game_screen: GameScreen,
@@ -232,7 +327,7 @@ impl State {
             world,
             camera,
             player,
-            walk_mode: true,
+            game_mode: GameMode::Survival,
             selected_block: BlockType::Stone,
             mouse_captured: false,
             last_frame: Instant::now(),
@@ -244,6 +339,9 @@ impl State {
             show_clouds: true,
             show_fog: true,
             show_build_info: true,
+            show_debug_panel: false,
+            debug_copy_flash_until: None,
+            rescue_cooldown_until: None,
             game_screen: GameScreen::Playing,
             current_player_chunk: (0, 0),
             render_radius: DEFAULT_RENDER_RADIUS,
@@ -306,6 +404,20 @@ impl State {
             }
             MouseButton::Right => {
                 let (x, y, z) = hit.place_pos;
+                // Solo en Creativo se impide construir donde está parado
+                // el jugador (evita quedar atrapado ahí mismo por
+                // accidente). En Supervivencia, como en Minecraft, SÍ se
+                // puede — si te encierras, tienes que cavar para salir;
+                // no hay red de seguridad. En Espectador la pregunta ni
+                // aplica: no hay colisión, nunca puede "encerrarte" a ti
+                // mismo.
+                if self.game_mode.blocks_self_placement() && self.player.occupies_block(x, y, z) {
+                    log::info!(
+                        "Colocación de bloque bloqueada en ({}, {}, {}): se solapa con el jugador (modo Creativo).",
+                        x, y, z
+                    );
+                    return;
+                }
                 self.world.set_block(x, y, z, self.selected_block)
             }
             _ => return,
@@ -313,6 +425,151 @@ impl State {
 
         for (cx, cz) in dirty {
             self.remesh_chunk(cx, cz);
+        }
+    }
+
+    /// Cambia el modo de juego activo, sincronizando cámara/jugador para
+    /// que la transición no teletransporte ni haga caer bruscamente a
+    /// nadie. Se llama solo desde el panel de ajustes (selector de 3
+    /// modos, ver `TouchAction::SetGameMode`) — no hay atajo de teclado
+    /// para ciclar modos en el juego, a propósito: cambiar de modo es
+    /// una decisión de "pausa y pienso qué quiero hacer", no algo para
+    /// alternar sin querer en medio del juego.
+    fn set_game_mode(&mut self, mode: GameMode) {
+        if self.game_mode == mode {
+            return;
+        }
+        // Tanto Survival como Creative usan `Player` (con o sin
+        // gravedad) y necesitan que `feet_position` arranque en la
+        // posición actual de la cámara — si no, al entrar a Survival
+        // desde Spectator el jugador "saltaría" a donde estaba parado
+        // la última vez que usó Player, potencialmente muy lejos de
+        // donde está la cámara ahora.
+        if matches!(mode, GameMode::Survival | GameMode::Creative) {
+            self.player.feet_position = Player::feet_from_eye_position(self.camera.position);
+            self.player.velocity = glam::Vec3::ZERO;
+        }
+        self.game_mode = mode;
+        log::info!("Modo de juego cambiado a {}", mode.label());
+    }
+
+    /// Auto-rescate (paso 5, solo se llama cuando `game_mode.auto_rescue()`
+    /// es true, hoy solo Creativo): si el jugador está atrapado dentro de
+    /// un sólido, lo teletransporta a la celda de aire libre más cercana.
+    /// Tiene un pequeño cooldown para no intentar rescatar en cada frame
+    /// mientras la física todavía se está asentando justo después de un
+    /// rescate (por ejemplo, si el punto elegido resultó estar pegado a
+    /// otro sólido y por redondeo el jugador vuelve a tocarlo un par de
+    /// frames después).
+    fn maybe_rescue_player(&mut self) {
+        if let Some(until) = self.rescue_cooldown_until {
+            if Instant::now() < until {
+                return;
+            }
+        }
+        if !self.player.is_trapped(&self.world) {
+            return;
+        }
+
+        // Radio de búsqueda: 8 bloques alcanza para salir de la mayoría
+        // de los casos reales (una pared fina, un techo, terreno
+        // generado encima) sin que la búsqueda se vuelva costosa. Si no
+        // encuentra nada en ese radio (por ejemplo, enterrado en pleno
+        // centro de una montaña sólida), no hacemos nada más que
+        // avisar por log — mejor eso que teletransportar a cualquier
+        // lado muy lejos de donde estaba el jugador.
+        match self.player.find_nearest_free_position(&self.world, 8) {
+            Some(free_pos) => {
+                log::info!(
+                    "Auto-rescate: jugador atrapado en ({:.1}, {:.1}, {:.1}), teletransportado a ({:.1}, {:.1}, {:.1}).",
+                    self.player.feet_position.x,
+                    self.player.feet_position.y,
+                    self.player.feet_position.z,
+                    free_pos.x,
+                    free_pos.y,
+                    free_pos.z,
+                );
+                self.player.feet_position = free_pos;
+                self.player.velocity = glam::Vec3::ZERO;
+                self.camera.position = self.player.eye_position();
+                self.rescue_cooldown_until = Some(Instant::now() + Duration::from_millis(500));
+            }
+            None => {
+                log::warn!(
+                    "Auto-rescate: jugador atrapado en ({:.1}, {:.1}, {:.1}), pero no se encontró aire libre en 8 bloques a la redonda.",
+                    self.player.feet_position.x,
+                    self.player.feet_position.y,
+                    self.player.feet_position.z,
+                );
+                // Igual aplicamos el cooldown: si no hay salida cercana,
+                // no tiene sentido volver a intentarlo cada frame — con
+                // el mismo mundo alrededor, el resultado va a ser el
+                // mismo hasta que el jugador o el mundo cambien algo.
+                self.rescue_cooldown_until = Some(Instant::now() + Duration::from_millis(500));
+            }
+        }
+    }
+
+    /// Arma los datos del panel de debug (F3) a partir del estado actual
+    /// del juego. Usado tanto para dibujar el panel (`render`) como para
+    /// armar el texto que copia el botón "COPIAR" (`copy_debug_snapshot`)
+    /// — un único lugar que arma estos datos evita que ambos se
+    /// desincronicen si en el futuro se agrega/cambia algún campo.
+    fn build_debug_panel_data(&self) -> ui_overlay::DebugPanelData {
+        let pos = self.camera.position;
+        let looking_at = raycast(&self.world, self.camera.position, self.camera.view_direction(), REACH)
+            .map(|hit| (hit.block_type.label().to_string(), hit.block_pos));
+        let game_mode_label = self.game_mode.label();
+        let log_file_hint = match platform::file_logger::log_file_path() {
+            Some(path) => path.display().to_string(),
+            None => "(no disponible)".to_string(),
+        };
+
+        ui_overlay::DebugPanelData {
+            player_pos: (pos.x, pos.y, pos.z),
+            chunk_pos: self.current_player_chunk,
+            looking_at,
+            fps: self.current_fps,
+            game_mode_label,
+            log_file_hint,
+        }
+    }
+
+    /// Copia un snapshot en texto plano de todo el panel de debug al
+    /// portapapeles del sistema (reutiliza el mismo mecanismo que ya
+    /// usaba la pantalla de crash — arboard en desktop, JNI en Android —
+    /// ver platform/crash.rs::copy_text_to_clipboard). Se dispara desde
+    /// el botón "COPIAR" del panel (click/touch, ver `handle_click` /
+    /// `TouchAction::CopyDebugSnapshot`).
+    fn copy_debug_snapshot(&mut self) {
+        let data = self.build_debug_panel_data();
+        let looking_at_text = match &data.looking_at {
+            Some((label, (x, y, z))) => format!("{label} en ({x}, {y}, {z})"),
+            None => "nada al alcance".to_string(),
+        };
+        let snapshot = format!(
+            "=== Voxel Engine: snapshot de debug ===\n\
+             Posición: ({:.2}, {:.2}, {:.2})\n\
+             Chunk: ({}, {})\n\
+             Mirando: {}\n\
+             Modo: {}\n\
+             FPS: {}\n\
+             Archivo de log: {}\n",
+            data.player_pos.0,
+            data.player_pos.1,
+            data.player_pos.2,
+            data.chunk_pos.0,
+            data.chunk_pos.1,
+            looking_at_text,
+            data.game_mode_label,
+            data.fps.round() as i32,
+            data.log_file_hint,
+        );
+        let copied = crash::copy_text_to_clipboard(&snapshot);
+        if copied {
+            self.debug_copy_flash_until = Some(Instant::now() + Duration::from_millis(1200));
+        } else {
+            log::warn!("No se pudo copiar el snapshot de debug al portapapeles.");
         }
     }
 
@@ -561,15 +818,40 @@ impl State {
             self.handle_click(MouseButton::Left);
         }
 
-        if self.walk_mode {
-            if self.camera.wants_jump() {
-                self.player.jump();
+        match self.game_mode {
+            GameMode::Survival => {
+                if self.camera.wants_jump() {
+                    self.player.jump();
+                }
+                let horizontal = self.camera.horizontal_move_vector(4.5);
+                self.player.update(&self.world, horizontal, dt);
+                self.camera.position = self.player.eye_position();
             }
-            let horizontal = self.camera.horizontal_move_vector(4.5);
-            self.player.update(&self.world, horizontal, dt);
-            self.camera.position = self.player.eye_position();
-        } else {
-            self.camera.update(dt);
+            GameMode::Creative => {
+                // Vuelo con colisión: no atraviesa bloques, pero sin
+                // gravedad ni salto — subir/bajar es directo con
+                // Espacio/Shift (ver Camera::free_move_vector).
+                let free_move = self.camera.free_move_vector(8.0);
+                self.player.fly_update(&self.world, free_move, dt);
+                self.camera.position = self.player.eye_position();
+            }
+            GameMode::Spectator => {
+                // Noclip: la cámara se mueve directo, sin pasar por
+                // Player ni chequear colisión contra el mundo.
+                self.camera.update(dt);
+            }
+        }
+
+        // Auto-rescate (solo Creativo, ver GameMode::auto_rescue): si el
+        // jugador quedó atrapado dentro de un sólido — por streaming de
+        // chunks, un bug, o al cargar un guardado viejo de antes del
+        // bloqueo de autoconstrucción — lo teletransporta a la celda de
+        // aire libre más cercana. En Supervivencia esto NO se ejecuta a
+        // propósito: como en Minecraft real, si te encierras tienes que
+        // cavar para salir. En Espectador no aplica porque sin colisión
+        // nunca se puede quedar "atrapado".
+        if self.game_mode.auto_rescue() {
+            self.maybe_rescue_player();
         }
 
         let aspect = self.render.config.width as f32 / self.render.config.height.max(1) as f32;
@@ -636,11 +918,12 @@ impl State {
             ui_overlay::build_settings_screen(
                 self.render.size,
                 self.show_fps,
-                self.walk_mode,
+                self.game_mode.index(),
                 self.render_radius,
                 self.show_clouds,
                 self.show_fog,
                 self.show_build_info,
+                self.show_debug_panel,
             )
         } else {
             let mut verts = ui_overlay::build_crosshair(self.render.size);
@@ -663,6 +946,27 @@ impl State {
                 verts.extend(ui_overlay::build_build_info_overlay(
                     self.render.size,
                     env!("VOXEL_BUILD_TAG"),
+                ));
+            }
+            // Panel de debug (F3): posición, chunk, bloque apuntado,
+            // modo, fps, ruta de log. Se dibuja debajo del overlay de
+            // build info si ambos están prendidos, para no superponerse.
+            if self.show_debug_panel {
+                let y_offset = if self.show_build_info {
+                    ui_overlay::build_info_overlay_height()
+                } else {
+                    0.0
+                };
+                let copy_flash = self
+                    .debug_copy_flash_until
+                    .map(|until| Instant::now() < until)
+                    .unwrap_or(false);
+                let data = self.build_debug_panel_data();
+                verts.extend(ui_overlay::build_debug_panel(
+                    self.render.size,
+                    &data,
+                    y_offset,
+                    copy_flash,
                 ));
             }
             verts
@@ -839,18 +1143,25 @@ fn build_chunk_mesh(
 fn android_main(app: AndroidApp) {
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
-    );
-
-    // Antes que nada: instalar el panic hook. `external_data_path()` cae
-    // bajo Android/data/<paquete>/files — visible sin root con un
-    // explorador de archivos o `adb pull`, a diferencia de la carpeta
-    // interna. Si por lo que sea no está disponible (algunos
-    // emuladores/ROMs raras) probamos con la interna; si ninguna está,
-    // `crash::install` igual sigue funcionando, solo que sin poder
-    // escribir el archivo (el reporte queda en logcat).
+    // `external_data_path()` cae bajo Android/data/<paquete>/files —
+    // visible sin root con un explorador de archivos o `adb pull`, a
+    // diferencia de la carpeta interna. Si por lo que sea no está
+    // disponible (algunos emuladores/ROMs raras) probamos con la
+    // interna; si ninguna está, tanto el logger de archivo como
+    // `crash::install` igual siguen funcionando, solo que sin poder
+    // escribir sus archivos (todo queda en logcat).
     let crash_dir = app.external_data_path().or_else(|| app.internal_data_path());
+
+    // Instala el logger (reemplaza a `android_logger::init_once`: sigue
+    // mandando todo a logcat exactamente igual que antes, y además
+    // escribe cada línea a game_log.txt en crash_dir — ver
+    // platform/file_logger.rs). Tiene que instalarse antes que
+    // `crash::install` para que el log::error! del panic hook realmente
+    // se imprima (antes de instalar un logger, los logs se descartan en
+    // silencio).
+    platform::file_logger::install(crash_dir.clone());
+
+    // Antes que nada: instalar el panic hook.
     crash::install(crash_dir.clone());
     // Además del panic hook (que solo ve panics de Rust): instalamos
     // manejadores de señal para crashes nativos de verdad (SIGSEGV,
@@ -918,10 +1229,14 @@ fn android_main(app: AndroidApp) {
 /// solo para poder construir el `EventLoop` de forma distinta según la
 /// plataforma (en Android lo arma `android_main` con `with_android_app`).
 pub fn run_desktop() {
-    env_logger::init();
-    // Instalado después de env_logger::init() para que el log::error!
-    // del hook realmente se imprima (antes de inicializar el logger,
-    // los logs se descartan en silencio).
+    // Reemplaza a `env_logger::init()`: sigue mandando todo a stderr
+    // exactamente igual que antes (respeta RUST_LOG), y además escribe
+    // cada línea a game_log.txt en la carpeta crash_logs (ver
+    // platform/file_logger.rs).
+    platform::file_logger::install(None);
+    // Instalado después del logger para que el log::error! del hook
+    // realmente se imprima (antes de inicializar el logger, los logs se
+    // descartan en silencio).
     crash::install(None);
     let event_loop = EventLoop::new().unwrap();
     // En desktop no hay chequeo de "corrida anterior" (ver
@@ -1193,14 +1508,29 @@ impl ApplicationHandler for App {
                             touch,
                             state.render.size,
                             state.show_fps,
-                            state.walk_mode,
+                            state.game_mode.index(),
                             state.show_clouds,
                             state.show_fog,
                             state.show_build_info,
+                            state.show_debug_panel,
                         )
                     } else {
                         // En juego: procesamos controles táctiles normales.
-                        state.touch.on_touch_game(touch, state.render.size)
+                        // Si el panel de debug está prendido, le pasamos
+                        // el rect de su botón "COPIAR" para que
+                        // on_touch_game lo detecte antes que cualquier
+                        // otra zona táctil (joystick, mira, etc.).
+                        let copy_rect = if state.show_debug_panel {
+                            let y_offset = if state.show_build_info {
+                                ui_overlay::build_info_overlay_height()
+                            } else {
+                                0.0
+                            };
+                            Some(ui_overlay::rect_debug_panel_copy_button(state.render.size, y_offset))
+                        } else {
+                            None
+                        };
+                        state.touch.on_touch_game(touch, state.render.size, copy_rect)
                     };
                     if let Some(action) = action {
                         match action {
@@ -1224,13 +1554,8 @@ impl ApplicationHandler for App {
                             TouchAction::ToggleFps => {
                                 state.show_fps = !state.show_fps;
                             }
-                            TouchAction::ToggleWalkMode => {
-                                state.walk_mode = !state.walk_mode;
-                                if state.walk_mode {
-                                    state.player.feet_position =
-                                        state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
-                                    state.player.velocity = glam::Vec3::ZERO;
-                                }
+                            TouchAction::SetGameMode(index) => {
+                                state.set_game_mode(GameMode::from_index(index));
                             }
                             TouchAction::DecreaseRenderRadius => {
                                 state.render_radius =
@@ -1248,6 +1573,12 @@ impl ApplicationHandler for App {
                             }
                             TouchAction::ToggleBuildInfo => {
                                 state.show_build_info = !state.show_build_info;
+                            }
+                            TouchAction::ToggleDebugPanel => {
+                                state.show_debug_panel = !state.show_debug_panel;
+                            }
+                            TouchAction::CopyDebugSnapshot => {
+                                state.copy_debug_snapshot();
                             }
                         }
                     }
@@ -1273,25 +1604,32 @@ impl ApplicationHandler for App {
                                 window.set_cursor_visible(true);
                             }
                         } else if event.state == ElementState::Pressed
-                            && code == winit::keyboard::KeyCode::KeyF
-                        {
-                            // Toggle entre modo caminar (gravedad + colisión)
-                            // y modo vuelo libre (útil para construir rápido
-                            // o inspeccionar el mundo desde arriba).
-                            state.walk_mode = !state.walk_mode;
-                            if state.walk_mode {
-                                // Sincronizamos al jugador con la posición
-                                // actual de la cámara para no teletransportar
-                                // ni hacer que caiga desde donde volaba.
-                                state.player.feet_position =
-                                    state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
-                                state.player.velocity = glam::Vec3::ZERO;
-                            }
-                        } else if event.state == ElementState::Pressed
                             && code == winit::keyboard::KeyCode::F5
                         {
                             let saved = state.world.save_dirty_chunks();
                             log::info!("Guardado manual: {} chunks escritos a disco.", saved);
+                        } else if event.state == ElementState::Pressed
+                            && code == winit::keyboard::KeyCode::F3
+                        {
+                            // Toggle del panel de debug (posición, chunk,
+                            // bloque apuntado, modo, fps, ruta de log).
+                            // Mismo estado que la fila "PANEL DE DEBUG
+                            // (F3)" del panel de ajustes.
+                            state.show_debug_panel = !state.show_debug_panel;
+                        } else if event.state == ElementState::Pressed
+                            && code == winit::keyboard::KeyCode::F4
+                            && state.show_debug_panel
+                        {
+                            // Copia el snapshot del panel de debug al
+                            // portapapeles — atajo de teclado equivalente
+                            // al botón "COPIAR" en pantalla, útil en
+                            // desktop porque con el mouse capturado
+                            // (jugando en primera persona) no se puede
+                            // clickear el botón sin soltar antes la
+                            // cámara. Solo activo si el panel está
+                            // prendido, para que F4 no haga nada
+                            // inesperado el resto del tiempo.
+                            state.copy_debug_snapshot();
                         } else if event.state == ElementState::Pressed
                             && matches!(
                                 code,
@@ -1324,12 +1662,11 @@ impl ApplicationHandler for App {
                     // por segundo, para no gastar tiempo de CPU formateando
                     // strings en cada frame.
                     if let Some(fps) = state.tick_fps() {
-                        let mode = if state.walk_mode { "Caminar" } else { "Vuelo" };
                         window.set_title(&format!(
-                            "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F: modo, F5: guardar",
+                            "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F3: debug, F5: guardar",
                             fps,
                             state.chunk_meshes.len(),
-                            mode,
+                            state.game_mode.label(),
                             state.selected_block
                         ));
                     }

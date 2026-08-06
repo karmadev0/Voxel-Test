@@ -318,7 +318,42 @@ fn emit_quad(
     let start_index = vertices.len() as u32;
 
     let corners = [to_f(p0), to_f(p1), to_f(p2), to_f(p3)];
-    let uvs = [[0.0, 0.0], [quad_w, 0.0], [quad_w, quad_h], [0.0, quad_h]];
+    // UV de textura (s = horizontal del atlas, t = vertical del atlas),
+    // que NO es lo mismo que los ejes de barrido u/v del greedy meshing
+    // de arriba (esos son sobre el mundo, elegidos genéricamente como
+    // (axis+1)%3 / (axis+2)%3 para que el sweep 2D funcione en cualquier
+    // dirección). Para las caras laterales (Norte/Sur/Este/Oeste) el
+    // arte SÍ tiene una orientación fija (pasto arriba, tierra abajo en
+    // grass_north.png etc.), así que acá forzamos que t siga siempre al
+    // eje Y del mundo, sin importar si el sweep genérico lo puso en du o
+    // en dv:
+    //   - axis 2 (Norte/Sur): dv ya es el eje Y (v=(2+2)%3=Y), pero en
+    //     t=0..h sin invertir quedaba con los pies (Y chico) apuntando
+    //     al top de la textura (pasto) y la cabeza a tierra — al revés.
+    //     Achicar Y (t más grande) = tierra, Y grande (t=0) = pasto.
+    //   - axis 0 (Este/Oeste): acá el eje Y del mundo cae en du, no en
+    //     dv (u=(0+1)%3=Y) — sin corregir, la textura quedaba rotada
+    //     90°: la franja pasto/tierra corría a lo largo de Z en vez de
+    //     Y. Mismo criterio de inversión que arriba, pero leyendo w (la
+    //     extensión de du) en vez de h.
+    // axis 1 (Arriba/Abajo) no tiene noción de "arriba" en su arte
+    // (pasto-arriba y piedra son ruido sin orientación), así que se
+    // queda con el mapeo genérico de siempre.
+    let uvs = match axis {
+        0 => [
+            [0.0, quad_w],
+            [0.0, 0.0],
+            [quad_h, 0.0],
+            [quad_h, quad_w],
+        ],
+        2 => [
+            [0.0, quad_h],
+            [quad_w, quad_h],
+            [quad_w, 0.0],
+            [0.0, 0.0],
+        ],
+        _ => [[0.0, 0.0], [quad_w, 0.0], [quad_w, quad_h], [0.0, quad_h]],
+    };
     for (c, uv) in corners.into_iter().zip(uvs) {
         vertices.push(Vertex {
             position: c,

@@ -34,6 +34,18 @@ impl BlockType {
     pub fn is_solid(&self) -> bool {
         !matches!(self, BlockType::Air)
     }
+
+    /// Nombre en mayúsculas para mostrar en overlays de texto (panel de
+    /// debug, ver logic/ui_overlay.rs) — la fuente bitmap del engine solo
+    /// soporta A-Z/0-9/algunos símbolos, así que ya viene en mayúsculas.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BlockType::Air => "AIRE",
+            BlockType::Grass => "PASTO",
+            BlockType::Dirt => "TIERRA",
+            BlockType::Stone => "PIEDRA",
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

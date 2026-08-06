@@ -462,6 +462,132 @@ pub fn build_build_info_overlay(size: PhysicalSize<u32>, build_tag: &str) -> Vec
     v
 }
 
+/// Alto total (con margen) del overlay de info de build, para que quien
+/// dibuje el panel de debug (F3) sepa cuánto bajarlo si ambos están
+/// prendidos a la vez, y no se superpongan.
+pub fn build_info_overlay_height() -> f64 {
+    BUILD_INFO_MARGIN + FONT_CELL_H * 2.0 + BUILD_INFO_LINE_GAP + BUILD_INFO_PADDING * 2.0
+}
+
+// ============================================================
+//  PANEL DE DEBUG (F3) — posición, chunk, bloque apuntado, modo
+// ============================================================
+// Panel de texto en la esquina superior izquierda (debajo del overlay de
+// build info si también está prendido) con datos para diagnosticar
+// problemas: posición exacta del jugador, chunk en el que está parado,
+// qué bloque está mirando la cámara (o "NADA" si no hay ninguno al
+// alcance), modo de movimiento actual, y la ruta del archivo de log en
+// disco (ver platform/file_logger.rs). Se arma en `lib.rs` a partir del
+// estado del juego y se le pasa ya formado a esta función; acá solo se
+// encarga del layout/dibujado, para no acoplar ui_overlay.rs a los tipos
+// internos del motor (Player, Camera, World, etc.).
+pub struct DebugPanelData {
+    pub player_pos: (f32, f32, f32),
+    pub chunk_pos: (i32, i32),
+    pub looking_at: Option<(String, (i32, i32, i32))>,
+    pub fps: f32,
+    pub game_mode_label: &'static str,
+    pub log_file_hint: String,
+}
+
+const DEBUG_PANEL_MARGIN: f64 = 16.0;
+const DEBUG_PANEL_PADDING: f64 = 10.0;
+const DEBUG_PANEL_LINE_GAP: f64 = 6.0;
+
+/// Botón "COPIAR" dentro del panel de debug: copia un snapshot en texto
+/// de todos estos datos al portapapeles (ver `handle_click`/tecla en
+/// lib.rs, que usa el mismo `arboard`/JNI que ya usaba crash.rs).
+pub fn rect_debug_panel_copy_button(size: PhysicalSize<u32>, y_offset: f64) -> (f64, f64, f64, f64) {
+    let panel_x = DEBUG_PANEL_MARGIN;
+    let panel_y = DEBUG_PANEL_MARGIN + y_offset;
+    // Mismo ancho que el panel (ver build_debug_panel) para que el botón
+    // quede pegado al borde inferior, ancho completo.
+    let panel_w = DEBUG_PANEL_WIDTH;
+    let lines = DEBUG_PANEL_LINE_COUNT as f64;
+    let text_block_h = lines * FONT_CELL_H + (lines - 1.0) * DEBUG_PANEL_LINE_GAP;
+    let button_y = panel_y + DEBUG_PANEL_PADDING * 2.0 + text_block_h;
+    (panel_x, button_y, panel_w, DEBUG_PANEL_BUTTON_H)
+}
+
+const DEBUG_PANEL_WIDTH: f64 = 460.0;
+const DEBUG_PANEL_BUTTON_H: f64 = 40.0;
+/// Cantidad fija de líneas de texto del panel: posición, chunk, mirando,
+/// modo, fps, archivo de log. Si se agrega/saca una línea en
+/// `build_debug_panel`, actualizar este número también (se usa para
+/// calcular la altura del panel y la posición del botón "COPIAR" sin
+/// tener que dibujar dos veces).
+const DEBUG_PANEL_LINE_COUNT: usize = 6;
+
+pub fn build_debug_panel(
+    size: PhysicalSize<u32>,
+    data: &DebugPanelData,
+    y_offset: f64,
+    copy_flash: bool,
+) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(512);
+
+    let panel_x = DEBUG_PANEL_MARGIN;
+    let panel_y = DEBUG_PANEL_MARGIN + y_offset;
+    let panel_w = DEBUG_PANEL_WIDTH;
+
+    let lines_text = [
+        format!(
+            "POS: {:.1} {:.1} {:.1}",
+            data.player_pos.0, data.player_pos.1, data.player_pos.2
+        ),
+        format!("CHUNK: {} {}", data.chunk_pos.0, data.chunk_pos.1),
+        match &data.looking_at {
+            Some((label, (x, y, z))) => format!("MIRANDO: {} {} {} {}", label, x, y, z),
+            None => "MIRANDO: NADA".to_string(),
+        },
+        format!("MODO: {}", data.game_mode_label),
+        format!("FPS: {}", data.fps.round() as i32),
+        format!("LOG: {}", data.log_file_hint),
+    ];
+    debug_assert_eq!(lines_text.len(), DEBUG_PANEL_LINE_COUNT);
+
+    let text_block_h = DEBUG_PANEL_LINE_COUNT as f64 * FONT_CELL_H
+        + (DEBUG_PANEL_LINE_COUNT as f64 - 1.0) * DEBUG_PANEL_LINE_GAP;
+    let panel_h = DEBUG_PANEL_PADDING * 2.0
+        + text_block_h
+        + DEBUG_PANEL_PADDING
+        + DEBUG_PANEL_BUTTON_H
+        + DEBUG_PANEL_PADDING;
+
+    // Fondo del panel.
+    push_quad(&mut v, size, (panel_x, panel_y, panel_w, panel_h), [0.0, 0.0, 0.0, 0.55]);
+
+    let text_x = panel_x + DEBUG_PANEL_PADDING;
+    let mut cur_y = panel_y + DEBUG_PANEL_PADDING;
+    for line in &lines_text {
+        // Truncamos líneas que no entrarían en el ancho del panel (por
+        // ejemplo "MIRANDO: PIEDRA 123 45 -678" con coordenadas muy
+        // largas) en vez de dejar que el texto se salga del panel.
+        let max_chars = ((panel_w - DEBUG_PANEL_PADDING * 2.0) / (FONT_CELL_W + FONT_CHAR_GAP))
+            .floor()
+            .max(1.0) as usize;
+        let shown: String = if line.chars().count() > max_chars {
+            line.chars().take(max_chars.saturating_sub(1)).collect::<String>() + ">"
+        } else {
+            line.clone()
+        };
+        push_text(&mut v, size, &shown.to_ascii_uppercase(), text_x, cur_y, [0.85, 0.92, 0.95, 0.95]);
+        cur_y += FONT_CELL_H + DEBUG_PANEL_LINE_GAP;
+    }
+
+    // Botón "COPIAR".
+    let button_rect = rect_debug_panel_copy_button(size, y_offset);
+    let button_color = if copy_flash { [0.25, 0.75, 0.35, 0.9] } else { [0.2, 0.28, 0.4, 0.9] };
+    push_quad(&mut v, size, button_rect, button_color);
+    let button_label = if copy_flash { "COPIADO!" } else { "COPIAR" };
+    let (bx, by, bw, bh) = button_rect;
+    let label_x = bx + (bw - text_width(button_label)) * 0.5;
+    let label_y = by + (bh - FONT_CELL_H) * 0.5;
+    push_text(&mut v, size, button_label, label_x, label_y, [0.9, 0.95, 1.0, 1.0]);
+
+    v
+}
+
 // ============================================================
 //  OVERLAY DE JUEGO (joystick, botones, hotbar, botón config)
 // ============================================================
@@ -524,11 +650,12 @@ pub fn build_touch_overlay(
 pub fn build_settings_screen(
     size: PhysicalSize<u32>,
     show_fps: bool,
-    walk_mode: bool,
+    game_mode_index: usize,
     render_radius: i32,
     show_clouds: bool,
     show_fog: bool,
     show_build_info: bool,
+    show_debug_panel: bool,
 ) -> Vec<UiVertex> {
     let mut v = Vec::with_capacity(512);
     let sw = size.width as f64;
@@ -571,16 +698,30 @@ pub fn build_settings_screen(
     // Separador entre filas.
     push_quad(&mut v, size, (row1.0, row1.1 + row1.3 + 4.0, row1.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 
-    // --- Fila 2: "MODO CAMINAR" con toggle ---
+    // --- Fila 2: "MODO DE JUEGO" — selector de 3 opciones ---
+    // A diferencia de las demás filas (un simple switch ON/OFF), acá hay
+    // una etiqueta propia arriba y 3 sub-botones lado a lado debajo:
+    // Supervivencia / Creativo / Espectador. El que coincide con
+    // `game_mode_index` se dibuja resaltado. `rect_settings_walk_row` ya
+    // viene con espacio extra reservado arriba para esta etiqueta (ver
+    // touch.rs) — no se superpone con la fila anterior.
     let row2 = TouchController::rect_settings_walk_row(size);
-    let label2_y = row2.1 + (row2.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "MODO CAMINAR", row2.0, label2_y, [0.85, 0.88, 0.95, 1.0]);
-    let switch2 = TouchController::rect_row_switch(row2);
-    push_toggle_switch(&mut v, size, switch2, walk_mode);
-    let state2 = if walk_mode { "ON" } else { "OFF" };
-    let state_color2: [f32; 4] = if walk_mode { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    let state2_x = switch2.0 - text_width(state2) - 12.0;
-    push_text(&mut v, size, state2, state2_x, label2_y, state_color2);
+    let label2_y = row2.1 - FONT_CELL_H - 6.0;
+    push_text(&mut v, size, "MODO DE JUEGO", row2.0, label2_y, [0.85, 0.88, 0.95, 1.0]);
+
+    const MODE_LABELS: [&str; 3] = ["SUPERVIV.", "CREATIVO", "ESPECT."];
+    for i in 0..3 {
+        let opt_rect = TouchController::rect_mode_option(size, i);
+        let selected = i == game_mode_index;
+        let bg = if selected { [0.25, 0.55, 0.35, 0.9] } else { [0.15, 0.17, 0.22, 0.85] };
+        push_quad(&mut v, size, opt_rect, bg);
+        let label = MODE_LABELS[i];
+        let (ox, oy, ow, oh) = opt_rect;
+        let text_color: [f32; 4] = if selected { [0.75, 1.0, 0.8, 1.0] } else { [0.65, 0.68, 0.75, 1.0] };
+        let lx = ox + (ow - text_width(label)) * 0.5;
+        let ly = oy + (oh - FONT_CELL_H) * 0.5;
+        push_text(&mut v, size, label, lx, ly, text_color);
+    }
 
     push_quad(&mut v, size, (row2.0, row2.1 + row2.3 + 4.0, row2.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 
@@ -648,6 +789,19 @@ pub fn build_settings_screen(
     push_text(&mut v, size, state6, state6_x, label6_y, state_color6);
 
     push_quad(&mut v, size, (row6.0, row6.1 + row6.3 + 4.0, row6.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+
+    // --- Fila 7: "PANEL DE DEBUG" con toggle ---
+    let row7 = TouchController::rect_settings_debug_panel_row(size);
+    let label7_y = row7.1 + (row7.3 - FONT_CELL_H) * 0.5;
+    push_text(&mut v, size, "PANEL DE DEBUG (F3)", row7.0, label7_y, [0.85, 0.88, 0.95, 1.0]);
+    let switch7 = TouchController::rect_row_switch(row7);
+    push_toggle_switch(&mut v, size, switch7, show_debug_panel);
+    let state7 = if show_debug_panel { "ON" } else { "OFF" };
+    let state_color7: [f32; 4] = if show_debug_panel { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
+    let state7_x = switch7.0 - text_width(state7) - 12.0;
+    push_text(&mut v, size, state7, state7_x, label7_y, state_color7);
+
+    push_quad(&mut v, size, (row7.0, row7.1 + row7.3 + 4.0, row7.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 
     // --- Botón "< VOLVER" arriba izquierda ---
     let back_rect = TouchController::rect_back_button(size);
