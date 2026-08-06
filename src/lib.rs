@@ -1335,7 +1335,6 @@ impl ApplicationHandler for App {
             }
             return;
         }
-        }
 
         // Todo lo que sigue (el juego en sí) va envuelto en
         // `catch_unwind`. Gracias a `panic = "unwind"` (Cargo.toml) un
