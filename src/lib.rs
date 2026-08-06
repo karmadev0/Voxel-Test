@@ -384,9 +384,23 @@ impl State {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                // Sin depth_stencil: el overlay siempre se dibuja encima
-                // de la escena 3D, sin testear ni escribir profundidad.
-                depth_stencil: None,
+                // El render_pass donde se dibuja este pipeline comparte el
+                // mismo depth attachment (Depth32Float) que render_pipeline
+                // -- wgpu exige que TODOS los pipelines usados en una pass
+                // declaren un depth_stencil compatible con sus attachments,
+                // aunque no lo usen, o tira "Incompatible depth-stencil
+                // attachment format" como en el crash. Para lograr "se
+                // dibuja siempre encima, sin testear ni escribir
+                // profundidad" hay que declarar el mismo formato pero con
+                // depth_write_enabled: false y depth_compare: Always (en
+                // vez de directamente omitir depth_stencil).
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
             })
@@ -724,9 +738,11 @@ impl State {
                 render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
             }
 
-            // Overlay táctil encima de todo (mismo render pass: al no
-            // tener `depth_stencil`, el pipeline de UI no testea ni pisa
-            // el depth buffer del terreno, así que siempre queda visible).
+            // Overlay táctil encima de todo (mismo render pass, mismo
+            // formato de depth attachment que render_pipeline por
+            // requisito de wgpu, pero con depth_compare: Always y
+            // depth_write_enabled: false, así que no testea ni pisa el
+            // depth buffer del terreno y siempre queda visible).
             #[cfg(target_os = "android")]
             {
                 render_pass.set_pipeline(&self.ui_pipeline);
