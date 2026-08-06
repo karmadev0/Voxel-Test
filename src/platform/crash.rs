@@ -469,10 +469,26 @@ extern "C" fn handle_fatal_signal(
 //      `ApplicationExitInfo` todavía no se terminó de poblar.
 #[cfg(target_os = "android")]
 pub fn check_previous_run_crash(crash_dir: Option<&std::path::Path>) -> Option<String> {
-    if let Some(short) = check_application_exit_info() {
+    if let Some(short) = check_application_exit_info(crash_dir) {
         return Some(short);
     }
     check_crash_file(crash_dir)
+}
+
+/// Escribe el reporte completo a un nombre de archivo FIJO
+/// (`last_report.txt`), pisando el anterior cada vez. Independiente de
+/// `native_crash.txt`/`last_crash.txt`/`.handled` (que sirven de
+/// historial y de fuente para el panic hook): esto es nada más para que
+/// el usuario tenga UN solo archivo predecible que revisar con un
+/// explorador de archivos, sin depender de si el copiado al portapapeles
+/// (JNI, y por lo tanto sensible a la ROM) funciona o no.
+#[cfg(target_os = "android")]
+fn write_last_report(dir: Option<&std::path::Path>, text: &str) {
+    if let Some(dir) = dir {
+        if let Err(e) = std::fs::write(dir.join("last_report.txt"), text) {
+            log::warn!("No se pudo escribir last_report.txt: {}", e);
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -485,7 +501,7 @@ pub fn check_previous_run_crash(_crash_dir: Option<&std::path::Path>) -> Option<
 }
 
 #[cfg(target_os = "android")]
-fn check_application_exit_info() -> Option<String> {
+fn check_application_exit_info(crash_dir: Option<&std::path::Path>) -> Option<String> {
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
@@ -625,6 +641,8 @@ fn check_application_exit_info() -> Option<String> {
     );
     let short_message = format!("{reason_name}: {description}");
 
+    write_last_report(crash_dir, &full_text);
+
     let mut slot = last_crash_slot().lock().unwrap_or_else(|e| e.into_inner());
     *slot = Some(CrashReport {
         full_text,
@@ -691,6 +709,8 @@ fn check_crash_file(crash_dir: Option<&std::path::Path>) -> Option<String> {
             continue;
         }
         let _ = std::fs::rename(&path, dir.join(format!("{name}.handled")));
+
+        write_last_report(Some(dir), &text);
 
         let short_message = text
             .lines()
