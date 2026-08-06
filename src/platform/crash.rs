@@ -500,70 +500,134 @@ pub fn check_previous_run_crash(_crash_dir: Option<&std::path::Path>) -> Option<
     None
 }
 
+/// Igual que `write_last_report` pero para diagnóstico: en vez de pisar,
+/// VA ACUMULANDO (append) cada paso de `check_application_exit_info` con
+/// su resultado. Como todo el camino de `ApplicationExitInfo` usa `?`
+/// (con `.ok()`, que descarta el motivo del error), sin esto un fallo en
+/// cualquier paso intermedio cae al fallback del archivo sin dejar
+/// ninguna pista de POR QUÉ — que es exactamente el síntoma que estamos
+/// viendo. Con esto, la próxima vez que revisés `exit_info_debug.txt`
+/// vas a ver la lista completa de pasos y en cuál se cortó.
+#[cfg(target_os = "android")]
+fn debug_log(dir: Option<&std::path::Path>, line: &str) {
+    if let Some(dir) = dir {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("exit_info_debug.txt"))
+        {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 fn check_application_exit_info(crash_dir: Option<&std::path::Path>) -> Option<String> {
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-    let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+    debug_log(crash_dir, "--- intento de ApplicationExitInfo ---");
 
-    // ApplicationExitInfo no existe antes de API 30: chequeamos
-    // Build.VERSION.SDK_INT antes de tocar nada de esa clase.
-    let sdk_int = env
-        .find_class("android/os/Build$VERSION")
-        .and_then(|c| env.get_static_field(c, "SDK_INT", "I"))
-        .and_then(|v| v.i())
-        .ok()?;
-    if sdk_int < 30 {
+    macro_rules! step {
+        ($label:expr, $e:expr) => {
+            match $e {
+                Ok(v) => {
+                    debug_log(crash_dir, &format!("{}: OK", $label));
+                    v
+                }
+                Err(e) => {
+                    debug_log(crash_dir, &format!("{}: ERROR {:?}", $label, e));
+                    return None;
+                }
+            }
+        };
+    }
+
+    let ctx = ndk_context::android_context();
+    let vm_raw = ctx.vm();
+    let ctx_raw = ctx.context();
+    debug_log(
+        crash_dir,
+        &format!("ndk_context: vm={:?} context={:?}", vm_raw, ctx_raw),
+    );
+    if vm_raw.is_null() || ctx_raw.is_null() {
+        debug_log(crash_dir, "ndk_context: vm o context nulos, abortando");
         return None;
     }
 
-    let package_name = env
-        .call_method(&activity, "getPackageName", "()Ljava/lang/String;", &[])
-        .and_then(|v| v.l())
-        .ok()?;
+    let vm = step!(
+        "JavaVM::from_raw",
+        unsafe { jni::JavaVM::from_raw(vm_raw.cast()) }
+    );
+    let mut env = step!("attach_current_thread", vm.attach_current_thread());
+    let activity = unsafe { jni::objects::JObject::from_raw(ctx_raw.cast()) };
 
-    let service_name = env.new_string("activity").ok()?;
-    let activity_manager = env
-        .call_method(
+    // ApplicationExitInfo no existe antes de API 30: chequeamos
+    // Build.VERSION.SDK_INT antes de tocar nada de esa clase.
+    let sdk_int = step!(
+        "SDK_INT",
+        env.find_class("android/os/Build$VERSION")
+            .and_then(|c| env.get_static_field(c, "SDK_INT", "I"))
+            .and_then(|v| v.i())
+    );
+    debug_log(crash_dir, &format!("SDK_INT = {}", sdk_int));
+    if sdk_int < 30 {
+        debug_log(crash_dir, "SDK_INT < 30, ApplicationExitInfo no existe");
+        return None;
+    }
+
+    let package_name = step!(
+        "getPackageName",
+        env.call_method(&activity, "getPackageName", "()Ljava/lang/String;", &[])
+            .and_then(|v| v.l())
+    );
+
+    let service_name = step!("new_string(activity)", env.new_string("activity"));
+    let activity_manager = step!(
+        "getSystemService(activity)",
+        env.call_method(
             &activity,
             "getSystemService",
             "(Ljava/lang/String;)Ljava/lang/Object;",
             &[(&service_name).into()],
         )
         .and_then(|v| v.l())
-        .ok()?;
+    );
 
     // getHistoricalProcessExitReasons(packageName, pid=0 -> cualquiera de
     // este paquete, maxNum=1 -> solo la más reciente; vienen ordenadas de
     // más nueva a más vieja).
-    let exit_infos = env
-        .call_method(
+    let exit_infos = step!(
+        "getHistoricalProcessExitReasons",
+        env.call_method(
             &activity_manager,
             "getHistoricalProcessExitReasons",
             "(Ljava/lang/String;II)Ljava/util/List;",
             &[(&package_name).into(), 0i32.into(), 1i32.into()],
         )
         .and_then(|v| v.l())
-        .ok()?;
+    );
 
-    let size = env
-        .call_method(&exit_infos, "size", "()I", &[])
-        .and_then(|v| v.i())
-        .ok()?;
+    let size = step!(
+        "size",
+        env.call_method(&exit_infos, "size", "()I", &[])
+            .and_then(|v| v.i())
+    );
+    debug_log(crash_dir, &format!("size = {}", size));
     if size == 0 {
+        debug_log(crash_dir, "lista vacía, no hay exit info registrada");
         return None;
     }
 
-    let info = env
-        .call_method(&exit_infos, "get", "(I)Ljava/lang/Object;", &[0i32.into()])
-        .and_then(|v| v.l())
-        .ok()?;
+    let info = step!(
+        "get(0)",
+        env.call_method(&exit_infos, "get", "(I)Ljava/lang/Object;", &[0i32.into()])
+            .and_then(|v| v.l())
+    );
 
-    let reason = env
-        .call_method(&info, "getReason", "()I", &[])
-        .and_then(|v| v.i())
-        .ok()?;
+    let reason = step!(
+        "getReason",
+        env.call_method(&info, "getReason", "()I", &[])
+            .and_then(|v| v.i())
+    );
 
     // Leemos los valores de las constantes REASON_* desde la propia
     // clase en vez de copiarlos a mano: distintas fuentes (documentación
@@ -572,26 +636,37 @@ fn check_application_exit_info(crash_dir: Option<&std::path::Path>) -> Option<St
     // que hardcodear un entero acá sería jugársela. Pedirle el valor a
     // la clase siempre da el correcto, sea cual sea la versión de
     // Android que esté corriendo.
-    let reason_crash = env
-        .find_class("android/app/ApplicationExitInfo")
-        .and_then(|c| env.get_static_field(c, "REASON_CRASH", "I"))
-        .and_then(|v| v.i())
-        .ok()?;
-    let reason_crash_native = env
-        .find_class("android/app/ApplicationExitInfo")
-        .and_then(|c| env.get_static_field(c, "REASON_CRASH_NATIVE", "I"))
-        .and_then(|v| v.i())
-        .ok()?;
-    let reason_anr = env
-        .find_class("android/app/ApplicationExitInfo")
-        .and_then(|c| env.get_static_field(c, "REASON_ANR", "I"))
-        .and_then(|v| v.i())
-        .ok()?;
+    let reason_crash = step!(
+        "REASON_CRASH",
+        env.find_class("android/app/ApplicationExitInfo")
+            .and_then(|c| env.get_static_field(c, "REASON_CRASH", "I"))
+            .and_then(|v| v.i())
+    );
+    let reason_crash_native = step!(
+        "REASON_CRASH_NATIVE",
+        env.find_class("android/app/ApplicationExitInfo")
+            .and_then(|c| env.get_static_field(c, "REASON_CRASH_NATIVE", "I"))
+            .and_then(|v| v.i())
+    );
+    let reason_anr = step!(
+        "REASON_ANR",
+        env.find_class("android/app/ApplicationExitInfo")
+            .and_then(|c| env.get_static_field(c, "REASON_ANR", "I"))
+            .and_then(|v| v.i())
+    );
+    debug_log(
+        crash_dir,
+        &format!(
+            "reason = {} (CRASH={}, CRASH_NATIVE={}, ANR={})",
+            reason, reason_crash, reason_crash_native, reason_anr
+        ),
+    );
 
     // Cualquier otro motivo (el usuario cerró la app, el sistema la mató
     // por poca memoria, una actualización de la app...) no es un crash
     // real: no queremos mostrar la pantalla roja por un cierre normal.
     if reason != reason_crash && reason != reason_crash_native && reason != reason_anr {
+        debug_log(crash_dir, "motivo no es crash/ANR, ignorado");
         return None;
     }
 
@@ -640,6 +715,7 @@ fn check_application_exit_info(crash_dir: Option<&std::path::Path>) -> Option<St
          {trace}\n"
     );
     let short_message = format!("{reason_name}: {description}");
+    debug_log(crash_dir, &format!("ÉXITO: {}", short_message));
 
     write_last_report(crash_dir, &full_text);
 
