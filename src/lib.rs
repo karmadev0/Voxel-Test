@@ -1379,4 +1379,3 @@ pub fn run(event_loop: EventLoop<()>, startup_crash: Option<String>) {
     }
     event_loop.run_app(&mut app).unwrap();
 }
-
