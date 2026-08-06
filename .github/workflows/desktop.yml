@@ -52,16 +52,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-desktop-
 
-      # Solo Linux necesita estas libs de sistema (X11/GL) para linkear;
-      # Windows y macOS traen lo que hace falta (DirectX/WGL, Metal) con
-      # el SDK del runner.
+      # Solo Linux necesita estas libs de sistema (X11/GL, GTK3) para
+      # linkear; Windows y macOS traen lo que hace falta (DirectX/WGL,
+      # Metal, y su propio diálogo nativo para `rfd`) con el SDK del
+      # runner. libgtk-3-dev es por `rfd` (diálogo nativo de la pantalla
+      # de crash, ver src/crash.rs), que en Linux usa GTK3 como backend.
       - name: Instalar dependencias del sistema (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxi-dev libxrandr-dev \
             libxcursor-dev libxinerama-dev libgl1-mesa-dev libegl1-mesa-dev \
-            pkg-config
+            libgtk-3-dev pkg-config
 
       # Solo el binario, no la lib cdylib (esa es para Android) — evita
       # compilar un .so/.dll que en desktop no se usa para nada.

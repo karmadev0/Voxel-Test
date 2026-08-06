@@ -39,6 +39,23 @@ libc = "0.2"
 # winit 0.30 trae android-activity 0.6.x, con más rodaje en ROMs de
 # fabricante (Honor/Huawei) que la 0.5.x vieja que traía winit 0.29.
 android-activity = "0.6"
+# Para copiar el log de crash al portapapeles del sistema en Android
+# (ver src/crash.rs): `android-activity` ya inicializa `ndk-context` solo
+# (guarda el JavaVM/Activity global apenas arranca la app), así que acá
+# solo hace falta leerlo y hacer las llamadas JNI a
+# android.content.ClipboardManager. Es el mismo patrón que usan crates
+# como cpal/oboe-rs para pedir permisos o hablar con APIs de Android.
+jni = "0.21"
+ndk-context = "0.1"
+
+# Solo desktop: pantalla de crash "de verdad" (cuadro de diálogo nativo
+# bloqueante con rfd) y poder volver a copiar el log completo al
+# portapapeles con la tecla C (arboard) mientras se ve la pantalla roja
+# de emergencia. En Android el portapapeles del sistema necesitaría JNI,
+# así que ahí nos quedamos con el archivo de log + logcat (ver crash.rs).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.14"
+arboard = "3"
 
 # Leído por `cargo apk build` (crate cargo-apk, ver el workflow de CI) para
 # generar el AndroidManifest.xml, firmar con la clave de debug y empaquetar
@@ -89,6 +106,12 @@ keystore_password = "android"
 # panic = "abort" no linkea bien en el cdylib de Android (el runtime de
 # NDK espera poder desenrollar el stack); "unwind" funciona en ambas
 # plataformas con un costo de rendimiento despreciable para este engine.
+# Además, desde que existe la pantalla de crash (ver src/crash.rs), esto
+# ya no es solo un detalle de linkeo de Android: "unwind" es lo que hace
+# posible que `std::panic::catch_unwind` (usado en el loop principal de
+# lib.rs) atrape un panic sin que se lleve puesto todo el proceso. Si
+# algún día se cambia a "abort" por algún motivo, la pantalla de crash
+# deja de funcionar en las dos plataformas, no solo en Android.
 [profile.release]
 opt-level = 3
 lto = true

@@ -11,6 +11,7 @@
 
 mod camera;
 mod chunk;
+mod crash;
 mod mesher;
 mod player;
 mod touch;
@@ -26,7 +27,7 @@ use player::Player;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use touch::{TouchAction, TouchController};
 use wgpu::util::DeviceExt;
 use winit::{
@@ -627,6 +628,71 @@ impl State {
         }
     }
 
+    /// Pantalla mínima que se muestra después de atrapar un panic: solo
+    /// limpia la superficie a rojo oscuro, sin tocar el mundo, las
+    /// mallas de chunks, ni ningún otro estado que pueda haber quedado a
+    /// medio actualizar cuando pasó el panic. A propósito no dibuja nada
+    /// del juego — la idea es no volver a ejecutar la lógica que
+    /// crasheó.
+    ///
+    /// `flash`: true durante un instante corto justo después de copiar
+    /// el log al portapapeles (tecla C en desktop, toque en Android).
+    /// Como el engine no tiene pipeline de texto, es la única forma que
+    /// tenemos hoy de confirmar "sí, se copió" sin depender de un log
+    /// que el usuario no está mirando en ese momento.
+    fn render_crash_screen(&mut self, flash: bool) -> Result<(), wgpu::SurfaceError> {
+        let output = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("crash_screen_encoder"),
+            });
+
+        let color = if flash {
+            // Verde: "listo, se copió". Nada más que un color distinto
+            // por un rato corto — ver comentario de `flash` arriba.
+            wgpu::Color {
+                r: 0.05,
+                g: 0.45,
+                b: 0.10,
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color {
+                r: 0.45,
+                g: 0.02,
+                b: 0.02,
+                a: 1.0,
+            }
+        };
+
+        {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("crash_screen_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
+    }
+
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -837,6 +903,16 @@ fn android_main(app: AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
+    // Antes que nada: instalar el panic hook. `external_data_path()` cae
+    // bajo Android/data/<paquete>/files — visible sin root con un
+    // explorador de archivos o `adb pull`, a diferencia de la carpeta
+    // interna. Si por lo que sea no está disponible (algunos
+    // emuladores/ROMs raras) probamos con la interna; si ninguna está,
+    // `crash::install` igual sigue funcionando, solo que sin poder
+    // escribir el archivo (el reporte queda en logcat).
+    let crash_dir = app.external_data_path().or_else(|| app.internal_data_path());
+    crash::install(crash_dir);
+
     let event_loop = match winit::event_loop::EventLoopBuilder::new()
         .with_android_app(app)
         .build()
@@ -885,6 +961,10 @@ fn android_main(app: AndroidApp) {
 /// plataforma (en Android lo arma `android_main` con `with_android_app`).
 pub fn run_desktop() {
     env_logger::init();
+    // Instalado después de env_logger::init() para que el log::error!
+    // del hook realmente se imprima (antes de inicializar el logger,
+    // los logs se descartan en silencio).
+    crash::install(None);
     let event_loop = EventLoop::new().unwrap();
     run(event_loop);
 }
@@ -896,6 +976,50 @@ pub fn run_desktop() {
 struct App {
     window: Option<Arc<Window>>,
     state: Option<State>,
+
+    // --- Manejo de crashes (ver crash.rs) ---
+    // Una vez que `catch_unwind` atrapa un panic en cualquiera de los
+    // callbacks de abajo, `crashed` queda en true para siempre (no hay
+    // forma segura de "seguir jugando" después de un panic a mitad de
+    // frame, así que no lo intentamos) y dejamos de correr toda la
+    // lógica normal del juego. `crash_short_message` es el mensaje corto
+    // para mostrar en el título de la ventana sin tener que ir a leer el
+    // archivo.
+    crashed: bool,
+    crash_short_message: Option<String>,
+    // Instante hasta el cual `render_crash_screen` debe mostrar el color
+    // de "copiado" en vez del rojo normal (ver comentario de `flash` en
+    // `State::render_crash_screen`). `None` = sin flash activo.
+    crash_copy_flash_until: Option<Instant>,
+}
+
+impl App {
+    /// Se llama la primera vez que `catch_unwind` atrapa un panic en
+    /// alguno de los callbacks de `ApplicationHandler`. Es idempotente
+    /// (no repite el diálogo si ya estábamos en pantalla de crash).
+    fn mark_crashed(&mut self) {
+        if self.crashed {
+            return;
+        }
+        self.crashed = true;
+
+        match crash::last_crash() {
+            Some((short, _full, file_path)) => {
+                self.crash_short_message = Some(short.clone());
+                // Diálogo nativo bloqueante: solo desktop (ver crash.rs).
+                // Se llama acá y no en el loop de render porque tiene que
+                // pasar una sola vez, no todos los frames.
+                #[cfg(not(target_os = "android"))]
+                crash::show_crash_dialog(&short, file_path.as_ref());
+                #[cfg(target_os = "android")]
+                let _ = file_path;
+            }
+            None => {
+                self.crash_short_message =
+                    Some("(no se pudo leer el mensaje del panic)".to_string());
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -903,21 +1027,36 @@ impl ApplicationHandler for App {
     // superficie nativa todavía no existe al arrancar la Activity), así
     // que el `State` de wgpu se inicializa recién ahí — y se reconstruye
     // si Android la destruye y recrea al volver de segundo plano.
+    //
+    // Todo el cuerpo va envuelto en `catch_unwind`: si `State::new()`
+    // panickea (por ejemplo, un adaptador GPU que no cumple algún límite
+    // en un dispositivo raro), lo atrapamos acá en vez de dejar que tire
+    // abajo el proceso. En ese caso puntual no llegamos a tener ni
+    // ventana ni superficie donde dibujar nada, así que la única señal
+    // que le queda al usuario es el diálogo nativo (desktop) y el
+    // archivo de log — pero al menos la app no se cierra de golpe sin
+    // dejar rastro.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            let attrs = Window::default_attributes()
-                .with_title("Voxel Engine - Fase 4")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
-            let win = Arc::new(event_loop.create_window(attrs).unwrap());
-            let new_state = pollster::block_on(State::new(win.clone()));
-            self.window = Some(win);
-            self.state = Some(new_state);
-        } else if self.state.is_none() {
-            // Android destruyó la superficie al pasar a segundo plano
-            // (ver `suspended()` más abajo) y ahora, al volver, nos avisa
-            // que hay una superficie nueva.
-            let win = self.window.as_ref().unwrap();
-            self.state = Some(pollster::block_on(State::new(win.clone())));
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.window.is_none() {
+                let attrs = Window::default_attributes()
+                    .with_title("Voxel Engine - Fase 4")
+                    .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+                let win = Arc::new(event_loop.create_window(attrs).unwrap());
+                let new_state = pollster::block_on(State::new(win.clone()));
+                self.window = Some(win);
+                self.state = Some(new_state);
+            } else if self.state.is_none() {
+                // Android destruyó la superficie al pasar a segundo plano
+                // (ver `suspended()` más abajo) y ahora, al volver, nos avisa
+                // que hay una superficie nueva.
+                let win = self.window.as_ref().unwrap();
+                self.state = Some(pollster::block_on(State::new(win.clone())));
+            }
+        }));
+
+        if panic_result.is_err() {
+            self.mark_crashed();
         }
     }
 
@@ -942,121 +1081,196 @@ impl ApplicationHandler for App {
         if window_id != window.id() {
             return;
         }
-        match event {
-            WindowEvent::CloseRequested => {
-                let saved = state.world.save_dirty_chunks();
-                if saved > 0 {
-                    log::info!("Guardados {} chunks modificados antes de salir.", saved);
-                }
-                event_loop.exit();
-            }
-            WindowEvent::Resized(physical_size) => state.resize(physical_size),
-            WindowEvent::MouseInput {
-                state: btn_state,
-                button,
-                ..
-            } => {
-                if !state.mouse_captured {
-                    // El primer click solo captura el mouse (como en
-                    // cualquier juego 3D en navegador/PC), no rompe ni
-                    // coloca nada todavía.
-                    if btn_state == ElementState::Pressed {
-                        state.mouse_captured = true;
-                        let _ = window
-                            .set_cursor_grab(CursorGrabMode::Confined)
-                            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
-                        window.set_cursor_visible(false);
+
+        if self.crashed {
+            // Ya atrapamos un panic antes: no volvemos a correr la
+            // lógica normal del juego (mundo, input, cámara...), que
+            // puede haber quedado en un estado a medio actualizar cuando
+            // pasó. Solo dejamos: cerrar la ventana, redibujar la
+            // pantalla roja, cambiarle el tamaño si hace falta, y copiar
+            // el log (tecla C en desktop, tocar la pantalla en Android).
+            match event {
+                WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Resized(new_size) => state.resize(new_size),
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                } => {
+                    if key_event.state == ElementState::Pressed {
+                        if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) =
+                            key_event.physical_key
+                        {
+                            if crash::copy_last_crash_to_clipboard() {
+                                log::info!("Log de crash copiado al portapapeles.");
+                                self.crash_copy_flash_until =
+                                    Some(Instant::now() + Duration::from_millis(700));
+                            }
+                        }
                     }
-                } else if btn_state == ElementState::Pressed {
-                    state.handle_click(button);
                 }
+                // Solo llega en Android (desktop no genera eventos de
+                // touch): tocar en cualquier parte de la pantalla de
+                // crash copia el log. Se dispara en `Started` y no en
+                // cada `Moved`, para que no haga falta un tap perfecto
+                // ni se repita todo el rato mientras el dedo sigue
+                // apoyado.
+                WindowEvent::Touch(touch)
+                    if touch.phase == winit::event::TouchPhase::Started =>
+                {
+                    if crash::copy_last_crash_to_clipboard() {
+                        log::info!("Log de crash copiado al portapapeles.");
+                        self.crash_copy_flash_until =
+                            Some(Instant::now() + Duration::from_millis(700));
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let flashing = self
+                        .crash_copy_flash_until
+                        .map(|t| Instant::now() < t)
+                        .unwrap_or(false);
+                    match state.render_crash_screen(flashing) {
+                        Ok(_) => {}
+                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                        Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                        Err(e) => log::warn!("Error de render (pantalla de crash): {:?}", e),
+                    }
+                    if let Some(msg) = &self.crash_short_message {
+                        window.set_title(&format!(
+                            "Voxel Engine — CRASHEADO: {} (C / tocar pantalla: copiar log)",
+                            msg
+                        ));
+                    }
+                }
+                _ => {}
             }
-            WindowEvent::Touch(touch) => {
-                if let Some(action) = state.touch.on_touch(touch, state.size) {
-                    match action {
-                        TouchAction::Break => state.handle_click(MouseButton::Left),
-                        TouchAction::Place => state.handle_click(MouseButton::Right),
-                        TouchAction::SelectBlock(n) => {
-                            state.selected_block = match n {
-                                1 => BlockType::Grass,
-                                2 => BlockType::Dirt,
+            return;
+        }
+
+        // Todo lo que sigue (el juego en sí) va envuelto en
+        // `catch_unwind`. Gracias a `panic = "unwind"` (Cargo.toml) un
+        // panic acá adentro no mata el proceso: solo aborta esta llamada
+        // puntual a `window_event`, y volvemos con `mark_crashed()` en
+        // vez de dejar que se propague hacia winit.
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match event {
+                WindowEvent::CloseRequested => {
+                    let saved = state.world.save_dirty_chunks();
+                    if saved > 0 {
+                        log::info!("Guardados {} chunks modificados antes de salir.", saved);
+                    }
+                    event_loop.exit();
+                }
+                WindowEvent::Resized(physical_size) => state.resize(physical_size),
+                WindowEvent::MouseInput {
+                    state: btn_state,
+                    button,
+                    ..
+                } => {
+                    if !state.mouse_captured {
+                        // El primer click solo captura el mouse (como en
+                        // cualquier juego 3D en navegador/PC), no rompe ni
+                        // coloca nada todavía.
+                        if btn_state == ElementState::Pressed {
+                            state.mouse_captured = true;
+                            let _ = window
+                                .set_cursor_grab(CursorGrabMode::Confined)
+                                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
+                            window.set_cursor_visible(false);
+                        }
+                    } else if btn_state == ElementState::Pressed {
+                        state.handle_click(button);
+                    }
+                }
+                WindowEvent::Touch(touch) => {
+                    if let Some(action) = state.touch.on_touch(touch, state.size) {
+                        match action {
+                            TouchAction::Break => state.handle_click(MouseButton::Left),
+                            TouchAction::Place => state.handle_click(MouseButton::Right),
+                            TouchAction::SelectBlock(n) => {
+                                state.selected_block = match n {
+                                    1 => BlockType::Grass,
+                                    2 => BlockType::Dirt,
+                                    _ => BlockType::Stone,
+                                };
+                            }
+                        }
+                    }
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        if code == winit::keyboard::KeyCode::Escape
+                            && event.state == ElementState::Pressed
+                        {
+                            state.mouse_captured = false;
+                            let _ = window.set_cursor_grab(CursorGrabMode::None);
+                            window.set_cursor_visible(true);
+                        } else if event.state == ElementState::Pressed
+                            && code == winit::keyboard::KeyCode::KeyF
+                        {
+                            // Toggle entre modo caminar (gravedad + colisión)
+                            // y modo vuelo libre (útil para construir rápido
+                            // o inspeccionar el mundo desde arriba).
+                            state.walk_mode = !state.walk_mode;
+                            if state.walk_mode {
+                                // Sincronizamos al jugador con la posición
+                                // actual de la cámara para no teletransportar
+                                // ni hacer que caiga desde donde volaba.
+                                state.player.feet_position =
+                                    state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
+                                state.player.velocity = glam::Vec3::ZERO;
+                            }
+                        } else if event.state == ElementState::Pressed
+                            && code == winit::keyboard::KeyCode::F5
+                        {
+                            let saved = state.world.save_dirty_chunks();
+                            log::info!("Guardado manual: {} chunks escritos a disco.", saved);
+                        } else if event.state == ElementState::Pressed
+                            && matches!(
+                                code,
+                                winit::keyboard::KeyCode::Digit1
+                                    | winit::keyboard::KeyCode::Digit2
+                                    | winit::keyboard::KeyCode::Digit3
+                            )
+                        {
+                            // Selección de bloque para colocar (hotbar simple).
+                            state.selected_block = match code {
+                                winit::keyboard::KeyCode::Digit1 => BlockType::Grass,
+                                winit::keyboard::KeyCode::Digit2 => BlockType::Dirt,
                                 _ => BlockType::Stone,
                             };
+                        } else {
+                            state.camera.process_key(code, event.state);
                         }
                     }
                 }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if code == winit::keyboard::KeyCode::Escape
-                        && event.state == ElementState::Pressed
-                    {
-                        state.mouse_captured = false;
-                        let _ = window.set_cursor_grab(CursorGrabMode::None);
-                        window.set_cursor_visible(true);
-                    } else if event.state == ElementState::Pressed
-                        && code == winit::keyboard::KeyCode::KeyF
-                    {
-                        // Toggle entre modo caminar (gravedad + colisión)
-                        // y modo vuelo libre (útil para construir rápido
-                        // o inspeccionar el mundo desde arriba).
-                        state.walk_mode = !state.walk_mode;
-                        if state.walk_mode {
-                            // Sincronizamos al jugador con la posición
-                            // actual de la cámara para no teletransportar
-                            // ni hacer que caiga desde donde volaba.
-                            state.player.feet_position =
-                                state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
-                            state.player.velocity = glam::Vec3::ZERO;
-                        }
-                    } else if event.state == ElementState::Pressed
-                        && code == winit::keyboard::KeyCode::F5
-                    {
-                        let saved = state.world.save_dirty_chunks();
-                        log::info!("Guardado manual: {} chunks escritos a disco.", saved);
-                    } else if event.state == ElementState::Pressed
-                        && matches!(
-                            code,
-                            winit::keyboard::KeyCode::Digit1
-                                | winit::keyboard::KeyCode::Digit2
-                                | winit::keyboard::KeyCode::Digit3
-                        )
-                    {
-                        // Selección de bloque para colocar (hotbar simple).
-                        state.selected_block = match code {
-                            winit::keyboard::KeyCode::Digit1 => BlockType::Grass,
-                            winit::keyboard::KeyCode::Digit2 => BlockType::Dirt,
-                            _ => BlockType::Stone,
-                        };
-                    } else {
-                        state.camera.process_key(code, event.state);
+                WindowEvent::RedrawRequested => {
+                    state.update();
+                    match state.render() {
+                        Ok(_) => {}
+                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                        Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                        Err(e) => log::warn!("Error de render: {:?}", e),
                     }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                state.update();
-                match state.render() {
-                    Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                    Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                    Err(e) => log::warn!("Error de render: {:?}", e),
-                }
 
-                // Actualizamos el título de la ventana con el FPS una vez
-                // por segundo, para no gastar tiempo de CPU formateando
-                // strings en cada frame.
-                if let Some(fps) = state.tick_fps() {
-                    let mode = if state.walk_mode { "Caminar" } else { "Vuelo" };
-                    window.set_title(&format!(
-                        "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F: modo, F5: guardar",
-                        fps,
-                        state.chunk_meshes.len(),
-                        mode,
-                        state.selected_block
-                    ));
+                    // Actualizamos el título de la ventana con el FPS una vez
+                    // por segundo, para no gastar tiempo de CPU formateando
+                    // strings en cada frame.
+                    if let Some(fps) = state.tick_fps() {
+                        let mode = if state.walk_mode { "Caminar" } else { "Vuelo" };
+                        window.set_title(&format!(
+                            "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F: modo, F5: guardar",
+                            fps,
+                            state.chunk_meshes.len(),
+                            mode,
+                            state.selected_block
+                        ));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+        }));
+
+        if panic_result.is_err() {
+            self.mark_crashed();
         }
     }
 
@@ -1066,16 +1280,28 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            if let Some(state) = self.state.as_mut() {
-                if state.mouse_captured {
-                    state.camera.process_mouse(delta.0, delta.1);
+        if self.crashed {
+            return;
+        }
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let DeviceEvent::MouseMotion { delta } = event {
+                if let Some(state) = self.state.as_mut() {
+                    if state.mouse_captured {
+                        state.camera.process_mouse(delta.0, delta.1);
+                    }
                 }
             }
+        }));
+        if panic_result.is_err() {
+            self.mark_crashed();
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Sigue pidiendo redraws aunque estemos crasheados: es lo que
+        // mantiene a `render_crash_screen()` dibujando (y, en Android,
+        // lo único que hace falta para que la pantalla roja quede
+        // visible en vez de congelada en el último frame del juego).
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }

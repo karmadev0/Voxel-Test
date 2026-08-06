@@ -51,6 +51,49 @@ Nuevo en Fase 5:
   frames más en terminar de aparecer el chunk nuevo (a cambio de no
   trabar nada).
 
+## Manejo de crashes (Fase 6)
+
+Antes, cualquier panic interno (bug de lógica, índice fuera de rango,
+`.unwrap()` sobre `None`, etc.) tiraba abajo toda la app sin dejar ningún
+rastro útil para depurar. Ahora (`src/crash.rs` + `lib.rs`):
+
+- **El proceso ya no se cierra solo.** Cada callback de winit
+  (`resumed`, `window_event`, `device_event`) está envuelto en
+  `std::panic::catch_unwind`. Si algo panickea ahí adentro, se atrapa y
+  la app queda abierta en una **pantalla roja de emergencia** en vez de
+  cerrarse — se deja de correr toda la lógica normal del juego a
+  propósito (el mundo puede haber quedado en un estado a medio
+  actualizar), pero la ventana sigue viva.
+- **Siempre queda un archivo con el reporte completo** (mensaje,
+  ubicación exacta en el código, backtrace):
+  - Desktop: carpeta `crash_logs/` al lado del ejecutable —
+    `crash_<timestamp>.txt` por cada crash, más `last_crash.txt` con el
+    más reciente.
+  - Android: `Android/data/com.voxelengine.fase4/files/crash_logs/` en
+    el almacenamiento del dispositivo (mismo esquema de archivos; se
+    puede sacar con un explorador de archivos o `adb pull`). Si por lo
+    que sea esa ruta no está disponible, el reporte igual queda en
+    `adb logcat` (buscar `PANIC:`).
+- **Desktop además muestra un cuadro de diálogo nativo** con el mensaje y
+  la ruta del log apenas pasa el crash, y se puede volver a copiar el
+  reporte completo al portapapeles apretando **C** mientras se ve la
+  pantalla roja.
+- **En Android, tocar en cualquier parte de la pantalla roja** copia el
+  log completo al portapapeles del sistema (vía JNI contra
+  `ClipboardManager`, no requiere ningún permiso especial). Como el
+  engine todavía no tiene un pipeline de texto para mostrar un mensaje de
+  confirmación en pantalla, la señal de "listo, se copió" es que la
+  pantalla cambia brevemente a verde y vuelve a rojo. No hay diálogo
+  nativo en Android (no tiene un equivalente simple sin agregar una
+  Activity/layout de Java aparte).
+- **Pendiente / próximo paso natural:** la pantalla de crash hoy es solo
+  un color sólido (no hay texto en pantalla porque el engine todavía no
+  tiene un pipeline de fuentes/texto — la hotbar de Android tiene la
+  misma limitación). Si en algún momento se agrega un pase de texto, lo
+  primero que lo va a aprovechar es justamente esta pantalla, para
+  mostrar el mensaje del crash directamente en Android sin depender de
+  logcat.
+
 ## Controles
 
 | Acción | Tecla |
