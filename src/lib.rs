@@ -181,6 +181,15 @@ impl State {
                     "Vulkan no encontró un adaptador GPU compatible (driver \
                      roto/ausente en esta ROM/dispositivo); reintentando con GLES."
                 );
+                // Clave: soltar la superficie/instancia de Vulkan ANTES de
+                // crear la de GLES. Las dos apuntan al mismo
+                // `ANativeWindow`, y si la de Vulkan sigue conectada al
+                // buffer queue nativo cuando intentamos conectar la de
+                // GLES, Android devuelve "already connected" y la
+                // superficie de GLES queda inválida (BadAlloc).
+                drop(surface);
+                drop(instance);
+
                 let gles_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                     backends: wgpu::Backends::GL,
                     ..Default::default()
