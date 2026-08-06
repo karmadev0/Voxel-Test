@@ -261,7 +261,7 @@ impl RenderState {
         // --- Pipeline ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shader.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -312,7 +312,7 @@ impl RenderState {
         let ui_pipeline = {
             let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ui_shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ui_shader.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ui_shader.wgsl").into()),
             });
             let ui_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -384,7 +384,7 @@ impl RenderState {
         let highlight_pipeline = {
             let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("highlight_shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/highlight_shader.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/highlight_shader.wgsl").into()),
             });
             let highlight_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -444,7 +444,7 @@ impl RenderState {
         let clouds_pipeline = {
             let clouds_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("clouds_shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/clouds_shader.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/clouds_shader.wgsl").into()),
             });
             let clouds_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
