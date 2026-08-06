@@ -52,6 +52,14 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
 
+      # Red de seguridad: desde enero 2026 los runners de GitHub ya no
+      # traen preinstaladas las plataformas de Android SDK viejas, y la
+      # lista de lo que sí viene por defecto puede seguir cambiando. Esto
+      # asegura que la plataforma 34 (la que usamos en target_sdk_version)
+      # esté instalada sin depender de qué traiga la imagen esta semana.
+      - name: Instalar plataforma Android SDK 34
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+
       - name: Instalar cargo-apk
         run: cargo install cargo-apk --locked
 

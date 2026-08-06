@@ -45,8 +45,16 @@ android-activity = "0.6"
 [package.metadata.android]
 package = "com.voxelengine.fase4"
 apk_label = "Voxel Engine"
-target_sdk_version = 33
+
+# cargo-apk (versión actual) espera min/target_sdk_version en esta
+# subtabla anidada, no sueltos bajo [package.metadata.android]. Además,
+# desde enero de 2026 los runners de GitHub Actions ya no traen
+# instaladas las plataformas de Android SDK por debajo de la 34, así
+# que target_sdk_version tiene que ser >= 34 o el build falla con
+# "Platform X is not installed".
+[package.metadata.android.sdk]
 min_sdk_version = 26
+target_sdk_version = 34
 # Vulkan es obligatorio: la Fase 4 no tiene fallback a GLES en Android.
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.vulkan.version"
