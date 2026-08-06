@@ -55,10 +55,13 @@ apk_label = "Voxel Engine"
 [package.metadata.android.sdk]
 min_sdk_version = 26
 target_sdk_version = 34
-# Vulkan es obligatorio: la Fase 4 no tiene fallback a GLES en Android.
+# Ya no es obligatorio: agregamos un fallback a GLES en el código para
+# dispositivos/ROMs sin un driver Vulkan que funcione (ver State::new en
+# lib.rs). Dejarlo en `required = true` haría que el sistema/Play Store
+# bloquee la instalación en esos equipos, contradiciendo ese fallback.
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.vulkan.version"
-required = true
+required = false
 version = 0x400000 # Vulkan 1.0
 
 [package.metadata.android.application]

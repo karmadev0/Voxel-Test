@@ -145,10 +145,14 @@ impl State {
         // en Mesa para esta generación de GPU integrada.
         // En desktop forzamos GL (Intel UHD 600 / Gemini Lake: menos
         // overhead de driver que Vulkan para escenas simples en Mesa).
-        // En Android forzamos Vulkan: el ANGLE/GLES de la mayoría de
+        // En Android preferimos Vulkan: el ANGLE/GLES de la mayoría de
         // los dispositivos da mucha peor latencia con wgpu que su
-        // Vulkan nativo, que además es obligatorio desde Android 7+
-        // en casi todo el hardware con soporte real de GPU.
+        // Vulkan nativo. Pero no lo forzamos a muerte: hay ROMs
+        // custom/dispositivos viejos (confirmado en un HTC U11 con
+        // Android 9 no oficial) donde el driver Vulkan del vendor está
+        // roto o ausente aunque el chip lo soporte en teoría, así que si
+        // Vulkan no encuentra adaptador compatible, caemos a GLES en vez
+        // de crashear directo.
         #[cfg(not(target_os = "android"))]
         let backends = wgpu::Backends::GL;
         #[cfg(target_os = "android")]
@@ -167,8 +171,39 @@ impl State {
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
-            .await
-            .expect("No se encontró un adaptador GPU compatible con el backend GL. Verificá los drivers Mesa.");
+            .await;
+
+        #[cfg(target_os = "android")]
+        let (surface, adapter) = match adapter {
+            Some(adapter) => (surface, adapter),
+            None => {
+                log::warn!(
+                    "Vulkan no encontró un adaptador GPU compatible (driver \
+                     roto/ausente en esta ROM/dispositivo); reintentando con GLES."
+                );
+                let gles_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::GL,
+                    ..Default::default()
+                });
+                let gles_surface = gles_instance.create_surface(window.clone()).unwrap();
+                let gles_adapter = gles_instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&gles_surface),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .expect(
+                        "Ni Vulkan ni GLES encontraron un adaptador GPU compatible en este dispositivo.",
+                    );
+                (gles_surface, gles_adapter)
+            }
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let adapter = adapter.expect(
+            "No se encontró un adaptador GPU compatible con el backend GL. Verificá los drivers Mesa.",
+        );
 
         log::info!("Adapter: {:?}", adapter.get_info());
 
