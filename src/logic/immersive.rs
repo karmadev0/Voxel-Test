@@ -71,6 +71,12 @@ fn apply_immersive_fullscreen_impl() -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
 
+    // OJO con esta firma: `jni_call` ata el lifetime del `JNIEnv` del
+    // closure al mismo `'local` del `env` de afuera (ver más abajo). Si
+    // en vez de eso quedara genérico sobre "cualquier" lifetime (HRTB),
+    // el compilador no deja devolver un `JObject` desde el closure —
+    // por eso el error "lifetime may not live long enough" que tiraba
+    // la build.
     let Some(window) = jni_call(&mut env, "Activity.getWindow", |env| {
         env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])
             .and_then(|v| v.l())
@@ -110,14 +116,22 @@ fn apply_immersive_fullscreen_impl() -> Result<(), String> {
 /// Devuelve `None` tanto si la llamada dio `Err` como si dejó una
 /// excepción pendiente; en ambos casos ya quedó logueado el motivo.
 #[cfg(target_os = "android")]
-fn jni_call<T>(
-    env: &mut jni::JNIEnv,
+fn jni_call<'local, T>(
+    env: &mut jni::JNIEnv<'local>,
     what: &str,
-    f: impl FnOnce(&mut jni::JNIEnv) -> Result<T, jni::errors::Error>,
+    f: impl FnOnce(&mut jni::JNIEnv<'local>) -> Result<T, jni::errors::Error>,
 ) -> Option<T> {
     let result = f(env);
 
-    if env.exception_check() {
+    // exception_check() en jni 0.21.x devuelve Result<bool, Error>, no
+    // bool a secas (versiones más nuevas del crate sí son infalibles
+    // acá). Si por lo que sea no se puede ni consultar, asumimos que
+    // podría haber algo pendiente y limpiamos igual — exception_clear()
+    // sin excepción pendiente es inofensivo, así que el "unwrap_or(true)"
+    // es el lado seguro.
+    let exception_pending = env.exception_check().unwrap_or(true);
+
+    if exception_pending {
         log::warn!(
             "JNI: excepción pendiente tras \"{}\" (método/clase probablemente ausente \
              en este dispositivo) — se limpia para no corromper la siguiente llamada",
@@ -141,7 +155,7 @@ fn jni_call<T>(
 /// que corre la app, no el `target_sdk_version`/`min_sdk_version` de
 /// compilación) para elegir qué API de pantalla completa probar primero.
 #[cfg(target_os = "android")]
-fn sdk_int(env: &mut jni::JNIEnv) -> Option<i32> {
+fn sdk_int<'local>(env: &mut jni::JNIEnv<'local>) -> Option<i32> {
     jni_call(env, "Build.VERSION.SDK_INT", |env| {
         env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
             .and_then(|v| v.i())
@@ -153,7 +167,10 @@ fn sdk_int(env: &mut jni::JNIEnv) -> Option<i32> {
 /// los extras (edge-to-edge, comportamiento sticky) se intentan pero no
 /// son condición para el éxito.
 #[cfg(target_os = "android")]
-fn apply_via_insets_controller(env: &mut jni::JNIEnv, window: &jni::objects::JObject) -> bool {
+fn apply_via_insets_controller<'local>(
+    env: &mut jni::JNIEnv<'local>,
+    window: &jni::objects::JObject,
+) -> bool {
     use jni::objects::JValue;
 
     // No esencial: si falla, en el peor caso queda una franja donde
@@ -254,7 +271,10 @@ fn apply_via_insets_controller(env: &mut jni::JNIEnv, window: &jni::objects::JOb
 /// fallback para cualquier dispositivo donde el camino moderno falle
 /// por la razón que sea.
 #[cfg(target_os = "android")]
-fn apply_via_legacy_flags(env: &mut jni::JNIEnv, window: &jni::objects::JObject) -> bool {
+fn apply_via_legacy_flags<'local>(
+    env: &mut jni::JNIEnv<'local>,
+    window: &jni::objects::JObject,
+) -> bool {
     // View.SYSTEM_UI_FLAG_LAYOUT_STABLE (0x100) | LAYOUT_HIDE_NAVIGATION
     // (0x200) | LAYOUT_FULLSCREEN (0x400) | HIDE_NAVIGATION (0x2) |
     // FULLSCREEN (0x4) | IMMERSIVE_STICKY (0x1000): la combinación
