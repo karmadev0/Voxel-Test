@@ -8,9 +8,16 @@
 /// El PNG se embebe en el binario con `include_bytes!` para no depender
 /// de encontrar el archivo en disco en tiempo de ejecución (crítico en
 /// Android, donde no hay un filesystem normal accesible por path relativo).
+///
+/// El atlas ya no vive como archivo estático en assets/textures/atlas.png:
+/// build.rs lo arma en cada compilación a partir de los PNG sueltos por
+/// cara en assets/textures/blocks/ (ver build.rs y assets/textures/blocks.txt)
+/// y lo deja en OUT_DIR, el directorio de salida que cargo genera para
+/// esta crate. `env!("OUT_DIR")` se resuelve en tiempo de compilación, así
+/// que esto sigue sin tocar filesystem en runtime.
 use image::GenericImageView;
 
-const ATLAS_BYTES: &[u8] = include_bytes!("../../assets/textures/atlas.png");
+const ATLAS_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/atlas.png"));
 
 pub struct TextureAtlas {
     pub bind_group_layout: wgpu::BindGroupLayout,

@@ -29,10 +29,12 @@ var atlas_texture: texture_2d<f32>;
 @group(1) @binding(1)
 var atlas_sampler: sampler;
 
-// Tiene que coincidir con ATLAS_COLS/ATLAS_ROWS en textures/atlas.rs. Si
-// el atlas cambia de grilla, actualizar ahí Y acá.
-const ATLAS_COLS: f32 = 4.0;
-const ATLAS_ROWS: f32 = 4.0;
+// Tiene que coincidir con ATLAS_COLS/ATLAS_ROWS en textures/atlas.rs, que
+// a su vez tiene que coincidir con la cantidad de líneas de
+// assets/textures/blocks.txt (build.rs arma 1 fila por bloque). Si
+// agregás un bloque a blocks.txt, actualizar ahí Y acá.
+const ATLAS_COLS: f32 = 6.0;
+const ATLAS_ROWS: f32 = 3.0;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,

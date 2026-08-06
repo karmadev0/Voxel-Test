@@ -3,6 +3,8 @@ name = "voxel-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Motor voxel propio (Fase 4: streaming de chunks + build Android)"
+# Combina assets/textures/blocks/*.png en el atlas embebido, ver build.rs.
+build = "build.rs"
 
 # La lib es lo que compila cargo-apk para Android (necesita cdylib) y
 # también lo que usa el binario de escritorio (rlib), para no duplicar
@@ -61,6 +63,12 @@ ndk-context = "0.1"
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.14"
 arboard = "3"
+
+# build.rs corre en la máquina que compila (host), no en el target
+# (Android incluido) — por eso necesita su propia copia de `image` acá,
+# aparte de la que ya está en [dependencies] para el motor en sí.
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Leído por `cargo apk build` (crate cargo-apk, ver el workflow de CI) para
 # generar el AndroidManifest.xml, firmar con la clave de debug y empaquetar
