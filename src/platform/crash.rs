@@ -579,13 +579,23 @@ fn check_application_exit_info() -> Option<String> {
         return None;
     }
 
-    let description = env
+    // Separado en pasos (en vez de encadenar con and_then) a propósito:
+    // `env.get_string(...)` devuelve un `JavaStr` que toma prestado el
+    // `JObject` de la descripción, así que ese `JObject` tiene que seguir
+    // vivo en ESTE scope hasta terminar de convertirlo a `String` (dueño
+    // de sus propios bytes) — encadenado dentro de un closure de
+    // `and_then`, el `JObject` moría al salir del closure mientras el
+    // `JavaStr` todavía lo referenciaba.
+    let description = match env
         .call_method(&info, "getDescription", "()Ljava/lang/String;", &[])
-        .ok()
-        .and_then(|v| v.l().ok())
-        .and_then(|obj| env.get_string((&obj).into()).ok())
-        .map(|s| s.into())
-        .unwrap_or_else(|| "(sin descripción)".to_string());
+        .and_then(|v| v.l())
+    {
+        Ok(obj) if !obj.is_null() => env
+            .get_string((&obj).into())
+            .map(|s| s.into())
+            .unwrap_or_else(|_| "(sin descripción)".to_string()),
+        _ => "(sin descripción)".to_string(),
+    };
 
     let reason_name = if reason == reason_crash_native {
         "CRASH_NATIVO"
@@ -700,4 +710,3 @@ fn check_crash_file(crash_dir: Option<&std::path::Path>) -> Option<String> {
     }
     None
 }
-
