@@ -777,12 +777,38 @@ fn android_main(app: AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
-    let event_loop = winit::event_loop::EventLoopBuilder::new()
+    let event_loop = match winit::event_loop::EventLoopBuilder::new()
         .with_android_app(app)
         .build()
-        .unwrap();
+    {
+        Ok(el) => el,
+        Err(e) => {
+            // Android reutiliza el proceso entre relanzamientos rápidos (es
+            // normal del sistema, para abrir apps más rápido sin recargar
+            // todo desde cero) pero `winit` solo permite construir un
+            // EventLoop una vez por proceso: la segunda vez, en vez de
+            // crashear, devuelve este error (típicamente
+            // `RecreationAttempt`; ver
+            // https://github.com/rust-windowing/winit/issues/3325). No hay
+            // forma de "recrear" el loop dentro del mismo proceso, así que
+            // matamos el proceso entero a propósito: el próximo toque en el
+            // ícono va a arrancar uno completamente nuevo, con la bandera
+            // interna de winit ya reseteada.
+            log::warn!(
+                "No se pudo (re)crear el EventLoop ({:?}); reiniciando el proceso.",
+                e
+            );
+            std::process::exit(0);
+        }
+    };
 
     run(event_loop);
+
+    // El loop terminó (el usuario cerró la app, o un error fatal de
+    // render). Forzamos la muerte del proceso en vez de dejar que Android
+    // lo mantenga vivo en caché para un relanzamiento rápido -- así el
+    // próximo lanzamiento arranca siempre desde cero.
+    std::process::exit(0);
 }
 
 /// Punto de entrada en desktop: lo llama `main.rs`. Separado de `run()`
