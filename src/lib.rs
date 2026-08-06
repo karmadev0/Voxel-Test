@@ -44,6 +44,16 @@ use world::{raycast, World};
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;
 
+/// Pantalla activa del juego. Controla qué se dibuja y si la lógica
+/// del juego (física, cámara) se actualiza o se pausa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameScreen {
+    /// Juego corriendo normalmente.
+    Playing,
+    /// Configuración fullscreen: el juego queda pausado.
+    Settings,
+}
+
 /// Lo que un hilo de fondo manda de vuelta al terminar de generar/cargar
 /// un chunk y mallearlo: coordenadas, el chunk (para insertarlo en
 /// `World`) y su malla ya calculada en CPU (`MeshData`) — lo único que
@@ -139,9 +149,11 @@ struct State {
     fps_timer: Instant,
     pub current_fps: f32,
     // Si se dibuja o no el contador de FPS en pantalla. Se puede
-    // prender/apagar desde el panel de configuración (botón de engranaje
-    // arriba a la derecha en Android); por defecto arranca visible.
+    // prender/apagar desde el panel de configuración.
     show_fps: bool,
+
+    /// Pantalla activa: Playing o Settings (pausa).
+    game_screen: GameScreen,
 }
 
 impl State {
@@ -542,6 +554,7 @@ impl State {
             fps_timer: Instant::now(),
             current_fps: 0.0,
             show_fps: true,
+            game_screen: GameScreen::Playing,
             current_player_chunk: (0, 0),
             chunk_loader,
             pending_chunks: std::collections::HashSet::new(),
@@ -835,6 +848,13 @@ impl State {
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
 
+        // En pantalla de configuración: el juego queda pausado.
+        // Solo actualizamos el tiempo para no acumular un dt enorme
+        // al volver al juego.
+        if self.game_screen == GameScreen::Settings {
+            return;
+        }
+
         // Volcamos el estado del joystick/botones táctiles a la cámara
         // antes de moverla, con la misma interfaz que usan las teclas.
         self.camera.set_touch_move_axis(self.touch.move_axis());
@@ -879,26 +899,30 @@ impl State {
                 label: Some("render_encoder"),
             });
 
-        // Geometría del overlay 2D de este frame: la mira central siempre,
-        // más los controles táctiles si estamos en Android. Se arma acá
-        // afuera (no dentro del bloque del render_pass) porque el buffer
-        // tiene que vivir al menos tanto como el `render_pass`, que le
-        // toma un préstamo más abajo con `set_vertex_buffer`.
-        let mut ui_vertices = ui_overlay::build_crosshair(self.size);
-        #[cfg(target_os = "android")]
-        ui_vertices.extend(ui_overlay::build_touch_overlay(
-            &self.touch,
-            self.size,
-            self.selected_block,
-            self.show_fps,
-        ));
-        // Contador de FPS en la esquina superior derecha. Usa el último
-        // promedio calculado por `tick_fps` (se actualiza 1 vez por
-        // segundo), no el FPS instantáneo del frame actual. Se puede
-        // apagar desde el panel de configuración (ver ui_overlay.rs).
-        if self.show_fps {
-            ui_vertices.extend(ui_overlay::build_fps_counter(self.current_fps, self.size));
-        }
+        // Geometría del overlay 2D de este frame.
+        // En pantalla de configuración: mostramos la pantalla fullscreen de
+        // ajustes encima del mundo congelado. En juego: mira + controles.
+        let ui_vertices = if self.game_screen == GameScreen::Settings {
+            ui_overlay::build_settings_screen(
+                self.size,
+                self.show_fps,
+                self.walk_mode,
+            )
+        } else {
+            let mut verts = ui_overlay::build_crosshair(self.size);
+            #[cfg(target_os = "android")]
+            verts.extend(ui_overlay::build_touch_overlay(
+                &self.touch,
+                self.size,
+                self.selected_block,
+                self.show_fps,
+            ));
+            // Contador de FPS en la esquina superior derecha.
+            if self.show_fps {
+                verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.size));
+            }
+            verts
+        };
         let ui_vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1390,7 +1414,20 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::Touch(touch) => {
-                    if let Some(action) = state.touch.on_touch(touch, state.size) {
+                    let action = if state.game_screen == GameScreen::Settings {
+                        // En pantalla de configuración: procesamos toques
+                        // del menú de ajustes solamente.
+                        state.touch.on_touch_settings(
+                            touch,
+                            state.size,
+                            state.show_fps,
+                            state.walk_mode,
+                        )
+                    } else {
+                        // En juego: procesamos controles táctiles normales.
+                        state.touch.on_touch_game(touch, state.size)
+                    };
+                    if let Some(action) = action {
                         match action {
                             TouchAction::Break => state.handle_click(MouseButton::Left),
                             TouchAction::Place => state.handle_click(MouseButton::Right),
@@ -1401,13 +1438,25 @@ impl ApplicationHandler for App {
                                     _ => BlockType::Stone,
                                 };
                             }
-                            // El propio TouchController ya guarda si el
-                            // panel de configuración está abierto o
-                            // cerrado (`settings_open()`); acá no hace
-                            // falta hacer nada más.
-                            TouchAction::ToggleSettings => {}
+                            TouchAction::OpenSettings => {
+                                state.game_screen = GameScreen::Settings;
+                            }
+                            TouchAction::CloseSettings => {
+                                state.game_screen = GameScreen::Playing;
+                                // Reiniciamos last_frame para no acumular
+                                // un dt gigante después de la pausa.
+                                state.last_frame = std::time::Instant::now();
+                            }
                             TouchAction::ToggleFps => {
                                 state.show_fps = !state.show_fps;
+                            }
+                            TouchAction::ToggleWalkMode => {
+                                state.walk_mode = !state.walk_mode;
+                                if state.walk_mode {
+                                    state.player.feet_position =
+                                        state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
+                                    state.player.velocity = glam::Vec3::ZERO;
+                                }
                             }
                         }
                     }
@@ -1417,9 +1466,21 @@ impl ApplicationHandler for App {
                         if code == winit::keyboard::KeyCode::Escape
                             && event.state == ElementState::Pressed
                         {
-                            state.mouse_captured = false;
-                            let _ = window.set_cursor_grab(CursorGrabMode::None);
-                            window.set_cursor_visible(true);
+                            if state.game_screen == GameScreen::Settings {
+                                // Cerrar configuración y volver al juego.
+                                state.game_screen = GameScreen::Playing;
+                                state.last_frame = std::time::Instant::now();
+                                state.mouse_captured = true;
+                                let _ = window.set_cursor_grab(CursorGrabMode::Confined)
+                                    .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
+                                window.set_cursor_visible(false);
+                            } else {
+                                // Abrir configuración (pausa).
+                                state.game_screen = GameScreen::Settings;
+                                state.mouse_captured = false;
+                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                window.set_cursor_visible(true);
+                            }
                         } else if event.state == ElementState::Pressed
                             && code == winit::keyboard::KeyCode::KeyF
                         {
