@@ -9,28 +9,29 @@
 /// eventos táctiles (ver `touch.rs`) para mover, mirar, romper/colocar y
 /// elegir bloque de la hotbar.
 
-mod camera;
-mod chunk;
-mod crash;
-mod highlight;
-mod immersive;
-mod mesher;
-mod player;
-mod touch;
-mod ui_overlay;
-mod world;
-mod worldgen;
+mod engine;
+mod environment;
+mod logic;
+mod physics;
+mod platform;
+mod textures;
 
-use camera::{projection_matrix, Camera};
-use chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Z};
-use glam::Mat4;
-use mesher::Vertex;
-use player::Player;
+use engine::camera::{projection_matrix, Camera};
+use engine::highlight;
+use engine::render_state::Uniforms;
+use environment::chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Z};
+use environment::mesher::Vertex;
+use environment::sky::{FOG_START_FRACTION, SKY_COLOR};
+use environment::world::{raycast, World};
+use logic::immersive;
+use logic::touch::{TouchAction, TouchController};
+use logic::ui_overlay;
+use physics::player::Player;
+use platform::crash;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use touch::{TouchAction, TouchController};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -39,7 +40,6 @@ use winit::{
     keyboard::PhysicalKey,
     window::{CursorGrabMode, Window, WindowId},
 };
-use world::{raycast, World};
 
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;
@@ -59,12 +59,26 @@ enum GameScreen {
 /// `World`) y su malla ya calculada en CPU (`MeshData`) — lo único que
 /// falta es subirla a la GPU, y eso se hace en el hilo principal porque
 /// `wgpu::Device` se usa ahí.
-type ChunkResult = ((i32, i32), chunk::Chunk, mesher::MeshData);
+type ChunkResult = ((i32, i32), environment::chunk::Chunk, environment::mesher::MeshData);
 
-// Radio de chunks a generar alrededor del origen (bajo a propósito:
-// en el Celeron N4000 preferimos ver menos mundo a buen framerate antes
-// que un mundo enorme que trabe el frame).
-const RENDER_RADIUS: i32 = 4;
+// Radio de chunks a generar alrededor del origen (bajo por defecto: en
+// el Celeron N4000 preferimos ver menos mundo a buen framerate antes
+// que un mundo enorme que trabe el frame). Ahora es ajustable en vivo
+// desde la pantalla de configuración (ver `State::render_radius`); esta
+// constante es solo el valor inicial.
+const DEFAULT_RENDER_RADIUS: i32 = 4;
+
+// Límites del slider de distancia de chunks en la pantalla de config.
+// El mínimo (1) es el radio más chico posible: el jugador solo ve el
+// chunk en el que está parado más el anillo que lo rodea. Con radios
+// tan cortos la niebla (ver `fog_start`/`fog_end` en `update`) es la que
+// evita que el borde del mundo cargado se vea como un corte abrupto.
+// El máximo (128) ya son 257x257 = 66049 chunks si se llegara a cargar
+// todo a la vez — en el hardware objetivo de este proyecto (Celeron
+// N4000) eso no da un framerate jugable, así que aunque la UI lo
+// permita, es responsabilidad de quien juega no dejarlo tan alto ahí.
+const MIN_RENDER_RADIUS: i32 = 1;
+const MAX_RENDER_RADIUS: i32 = 128;
 
 /// Cuántos chunks recién llegados del hilo de fondo se convierten a
 /// buffers de GPU por frame como máximo. Crear un `wgpu::Buffer` no es
@@ -77,12 +91,6 @@ const MAX_FINALIZED_CHUNKS_PER_FRAME: usize = 2;
 // Distancia máxima (en bloques) a la que se puede romper/colocar.
 const REACH: f32 = 6.0;
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    view_proj: [[f32; 4]; 4],
-}
-
 struct ChunkMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -90,26 +98,14 @@ struct ChunkMesh {
 }
 
 struct State {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
+    // Device/queue/surface, pipelines y buffers de wgpu (ver
+    // engine/render_state.rs). Todo lo puramente gráfico vive ahí.
+    render: engine::render_state::RenderState,
 
-    render_pipeline: wgpu::RenderPipeline,
-    // Pipeline del overlay 2D: sin depth test contra el mundo (siempre se
-    // dibuja encima), con alpha blending. En Android dibuja los controles
-    // táctiles; en las dos plataformas dibuja la mira central (Fase 5).
-    ui_pipeline: wgpu::RenderPipeline,
-    // Pipeline del contorno wireframe que marca el bloque apuntado
-    // (Fase 5, ver highlight.rs). A diferencia de ui_pipeline, este SÍ
-    // testea profundidad contra el mundo (para quedar oculto si hay algo
-    // por delante), pero no la escribe.
-    highlight_pipeline: wgpu::RenderPipeline,
-    depth_texture_view: wgpu::TextureView,
-
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
+    // Instante en el que arrancó la app: `time.x` en los uniforms (ver
+    // arriba) se calcula como el tiempo transcurrido desde acá, para
+    // animar el desplazamiento de las nubes con el viento.
+    start_time: Instant,
 
     chunk_meshes: HashMap<(i32, i32), ChunkMesh>,
     world: World,
@@ -127,8 +123,18 @@ struct State {
 
     // Streaming de chunks: recordamos en qué chunk está parado el jugador
     // para no recalcular qué cargar/descargar en cada frame — solo cuando
-    // realmente cruza a un chunk distinto.
+    // realmente cruza a un chunk distinto (o cambia `render_radius` desde
+    // la pantalla de config, ver `last_streamed_render_radius`).
     current_player_chunk: (i32, i32),
+
+    // Radio de chunks actual (ajustable en vivo, ver `MIN_RENDER_RADIUS`/
+    // `MAX_RENDER_RADIUS` y la fila "Distancia de chunks" en la pantalla
+    // de configuración). `last_streamed_render_radius` es el valor que
+    // tenía la última vez que `update_chunk_streaming` cargó/descargó
+    // chunks; cuando difiere de `render_radius`, forzamos un recálculo
+    // aunque el jugador siga parado en el mismo chunk.
+    render_radius: i32,
+    last_streamed_render_radius: i32,
 
     // --- Streaming asincrónico de chunks ---
     // `chunk_loader` es el handle liviano que se clona y se manda a
@@ -137,7 +143,7 @@ struct State {
     // volvió del hilo de fondo. El resultado (chunk + su malla ya
     // calculada, todo trabajo de CPU) vuelve por `chunk_result_rx`; recién
     // ahí, en el hilo principal, se sube a la GPU (`finalize_ready_chunks`).
-    chunk_loader: world::ChunkLoader,
+    chunk_loader: environment::world::ChunkLoader,
     pending_chunks: std::collections::HashSet<(i32, i32)>,
     chunk_result_tx: std::sync::mpsc::Sender<ChunkResult>,
     chunk_result_rx: std::sync::mpsc::Receiver<ChunkResult>,
@@ -151,6 +157,17 @@ struct State {
     // Si se dibuja o no el contador de FPS en pantalla. Se puede
     // prender/apagar desde el panel de configuración.
     show_fps: bool,
+    // Si se dibuja o no la capa de nubes (draw call de `clouds_pipeline`
+    // en `render`). Prendido/apagado desde el panel de configuración,
+    // fila "NUBES".
+    show_clouds: bool,
+    // Si la niebla de distancia está activa. Cuando es `false`, `update`
+    // manda un `fog_start`/`fog_end` centinela enorme en vez del
+    // calculado a partir de `render_radius`, así el mix hacia
+    // `SKY_COLOR` nunca llega a activarse, ni en el terreno ni en el
+    // borde de la capa de nubes. Prendido/apagado desde el panel de
+    // configuración, fila "NIEBLA".
+    show_fog: bool,
 
     /// Pantalla activa: Playing o Settings (pausa).
     game_screen: GameScreen,
@@ -158,337 +175,12 @@ struct State {
 
 impl State {
     async fn new(window: Arc<winit::window::Window>) -> Self {
-        let size = window.inner_size();
-
-        // Forzamos el backend GL explícitamente: en el hardware objetivo
-        // (Intel UHD 600, Gemini Lake) OpenGL 4.5 tiene menos overhead de
-        // driver que Vulkan para escenas simples, y es la ruta más estable
-        // en Mesa para esta generación de GPU integrada.
-        // En desktop forzamos GL (Intel UHD 600 / Gemini Lake: menos
-        // overhead de driver que Vulkan para escenas simples en Mesa).
-        // En Android preferimos Vulkan: el ANGLE/GLES de la mayoría de
-        // los dispositivos da mucha peor latencia con wgpu que su
-        // Vulkan nativo. Pero no lo forzamos a muerte: hay ROMs
-        // custom/dispositivos viejos (confirmado en un HTC U11 con
-        // Android 9 no oficial) donde el driver Vulkan del vendor está
-        // roto o ausente aunque el chip lo soporte en teoría, así que si
-        // Vulkan no encuentra adaptador compatible, caemos a GLES en vez
-        // de crashear directo.
-        #[cfg(not(target_os = "android"))]
-        let backends = wgpu::Backends::GL;
-        #[cfg(target_os = "android")]
-        let backends = wgpu::Backends::VULKAN;
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
-
-        let surface = instance.create_surface(window.clone()).unwrap();
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await;
-
-        #[cfg(target_os = "android")]
-        let (surface, adapter) = match adapter {
-            Some(adapter) => (surface, adapter),
-            None => {
-                log::warn!(
-                    "Vulkan no encontró un adaptador GPU compatible (driver \
-                     roto/ausente en esta ROM/dispositivo); reintentando con GLES."
-                );
-                // Clave: soltar la superficie/instancia de Vulkan ANTES de
-                // crear la de GLES. Las dos apuntan al mismo
-                // `ANativeWindow`, y si la de Vulkan sigue conectada al
-                // buffer queue nativo cuando intentamos conectar la de
-                // GLES, Android devuelve "already connected" y la
-                // superficie de GLES queda inválida (BadAlloc).
-                drop(surface);
-                drop(instance);
-
-                let gles_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                    backends: wgpu::Backends::GL,
-                    ..Default::default()
-                });
-                let gles_surface = gles_instance.create_surface(window.clone()).unwrap();
-                let gles_adapter = gles_instance
-                    .request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::HighPerformance,
-                        compatible_surface: Some(&gles_surface),
-                        force_fallback_adapter: false,
-                    })
-                    .await
-                    .expect(
-                        "Ni Vulkan ni GLES encontraron un adaptador GPU compatible en este dispositivo.",
-                    );
-                (gles_surface, gles_adapter)
-            }
-        };
-
-        #[cfg(not(target_os = "android"))]
-        let adapter = adapter.expect(
-            "No se encontró un adaptador GPU compatible con el backend GL. Verificá los drivers Mesa.",
-        );
-
-        log::info!("Adapter: {:?}", adapter.get_info());
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    // Límites "downlevel" porque el backend GL en hardware
-                    // integrado no soporta todos los límites de wgpu por defecto.
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
-                },
-                None,
-            )
-            .await
-            .expect("No se pudo crear el device wgpu");
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let depth_texture_view = create_depth_texture(&device, &config);
-
-        // --- Uniform buffer (matriz view-projection) ---
-        let uniforms = Uniforms {
-            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-        };
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("uniform_buffer"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("uniform_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uniform_bind_group"),
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        // --- Pipeline ---
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline_layout"),
-            bind_group_layouts: &[&uniform_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Vertex::desc()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
-
-        // --- Pipeline del overlay 2D: mira central (ambas plataformas) +
-        // controles táctiles (solo Android) ---
-        let ui_pipeline = {
-            let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("ui_shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("ui_shader.wgsl").into()),
-            });
-            let ui_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("ui_pipeline_layout"),
-                    // Sin bind groups: las posiciones ya vienen en NDC
-                    // calculadas en CPU (ui_overlay.rs), no hace falta
-                    // ninguna matriz ni uniform acá.
-                    bind_group_layouts: &[],
-                    push_constant_ranges: &[],
-                });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("ui_pipeline"),
-                layout: Some(&ui_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &ui_shader,
-                    entry_point: "vs_main",
-                    buffers: &[ui_overlay::UiVertex::desc()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &ui_shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        // Alpha blending normal: el overlay es
-                        // semitransparente y tiene que mezclarse con la
-                        // escena 3D ya dibujada, no reemplazarla.
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    // Los triángulos del overlay se arman sin cuidar el
-                    // winding (son formas 2D, no un objeto 3D con "atrás"),
-                    // así que no conviene cullear ninguna cara.
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                // El render_pass donde se dibuja este pipeline comparte el
-                // mismo depth attachment (Depth32Float) que render_pipeline
-                // -- wgpu exige que TODOS los pipelines usados en una pass
-                // declaren un depth_stencil compatible con sus attachments,
-                // aunque no lo usen, o tira "Incompatible depth-stencil
-                // attachment format" como en el crash. Para lograr "se
-                // dibuja siempre encima, sin testear ni escribir
-                // profundidad" hay que declarar el mismo formato pero con
-                // depth_write_enabled: false y depth_compare: Always (en
-                // vez de directamente omitir depth_stencil).
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            })
-        };
-
-        // --- Pipeline del contorno del bloque apuntado (Fase 5) ---
-        // Reusa `uniform_bind_group_layout` (view_proj) porque dibuja en
-        // espacio de mundo real, no en NDC como el overlay 2D — necesita
-        // la misma transformación de cámara que el terreno.
-        let highlight_pipeline = {
-            let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("highlight_shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("highlight_shader.wgsl").into()),
-            });
-            let highlight_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("highlight_pipeline_layout"),
-                    bind_group_layouts: &[&uniform_bind_group_layout],
-                    push_constant_ranges: &[],
-                });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("highlight_pipeline"),
-                layout: Some(&highlight_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &highlight_shader,
-                    entry_point: "vs_main",
-                    buffers: &[highlight::HighlightVertex::desc()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &highlight_shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                // A diferencia del overlay 2D: SÍ testea profundidad
-                // contra el mundo (para que el contorno quede oculto
-                // detrás de terreno que lo tape), pero no la escribe —
-                // así no interfiere con el depth de los chunks dibujados
-                // después de él si el orden cambiara en algún momento.
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            })
-        };
+        let render = engine::render_state::RenderState::new(window).await;
 
         // --- Generación de mundo (paralela con rayon) ---
         log::info!("Generando terreno...");
         let mut world = World::new(1337);
-        world.generate_area(RENDER_RADIUS);
+        world.generate_area(DEFAULT_RENDER_RADIUS);
 
         // Malleamos (greedy meshing) todos los chunks generados, en
         // paralelo, aprovechando los 2 núcleos / 2 hilos del Celeron N4000.
@@ -498,10 +190,10 @@ impl State {
         // en el borde exterior del radio, donde no hay más remedio que
         // tratar "fuera del mundo cargado" como aire.
         let coords: Vec<(i32, i32)> = world.chunks.keys().copied().collect();
-        let mesh_data: Vec<((i32, i32), mesher::MeshData)> = coords
+        let mesh_data: Vec<((i32, i32), environment::mesher::MeshData)> = coords
             .par_iter()
             .map(|&(cx, cz)| {
-                let mesh = world.generate_chunk_mesh(cx, cz).unwrap_or(mesher::MeshData {
+                let mesh = world.generate_chunk_mesh(cx, cz).unwrap_or(environment::mesher::MeshData {
                     vertices: Vec::new(),
                     indices: Vec::new(),
                 });
@@ -520,7 +212,7 @@ impl State {
             if mesh.indices.is_empty() {
                 continue;
             }
-            chunk_meshes.insert((cx, cz), build_chunk_mesh(&device, cx, cz, &mesh));
+            chunk_meshes.insert((cx, cz), build_chunk_mesh(&render.device, cx, cz, &mesh));
         }
 
         let camera = Camera::new(glam::Vec3::new(8.0, 40.0, 8.0));
@@ -530,17 +222,8 @@ impl State {
         let (chunk_result_tx, chunk_result_rx) = std::sync::mpsc::channel();
 
         Self {
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            render_pipeline,
-            ui_pipeline,
-            highlight_pipeline,
-            depth_texture_view,
-            uniform_buffer,
-            uniform_bind_group,
+            render,
+            start_time: Instant::now(),
             chunk_meshes,
             world,
             camera,
@@ -554,8 +237,12 @@ impl State {
             fps_timer: Instant::now(),
             current_fps: 0.0,
             show_fps: true,
+            show_clouds: true,
+            show_fog: true,
             game_screen: GameScreen::Playing,
             current_player_chunk: (0, 0),
+            render_radius: DEFAULT_RENDER_RADIUS,
+            last_streamed_render_radius: DEFAULT_RENDER_RADIUS,
             chunk_loader,
             pending_chunks: std::collections::HashSet::new(),
             chunk_result_tx,
@@ -587,7 +274,7 @@ impl State {
     fn remesh_chunk(&mut self, cx: i32, cz: i32) {
         match self.world.generate_chunk_mesh(cx, cz) {
             Some(mesh) if !mesh.indices.is_empty() => {
-                let gpu_mesh = build_chunk_mesh(&self.device, cx, cz, &mesh);
+                let gpu_mesh = build_chunk_mesh(&self.render.device, cx, cz, &mesh);
                 self.chunk_meshes.insert((cx, cz), gpu_mesh);
             }
             _ => {
@@ -598,7 +285,7 @@ impl State {
 
     /// Lanza un rayo desde la cámara y rompe (click izquierdo) o coloca
     /// (click derecho) un bloque, usando DDA para encontrar el bloque
-    /// exacto apuntado (ver world::raycast).
+    /// exacto apuntado (ver environment::world::raycast).
     fn handle_click(&mut self, button: MouseButton) {
         let origin = self.camera.position;
         let direction = self.camera.view_direction();
@@ -638,14 +325,17 @@ impl State {
         let pos = self.camera.position;
         let player_chunk = World::world_pos_to_chunk(pos.x, pos.z);
 
-        if player_chunk == self.current_player_chunk && !self.chunk_meshes.is_empty() {
+        let radius_changed = self.render_radius != self.last_streamed_render_radius;
+        if player_chunk == self.current_player_chunk && !radius_changed && !self.chunk_meshes.is_empty() {
             return;
         }
         self.current_player_chunk = player_chunk;
+        self.last_streamed_render_radius = self.render_radius;
 
         let (pcx, pcz) = player_chunk;
-        let wanted: std::collections::HashSet<(i32, i32)> = (-RENDER_RADIUS..=RENDER_RADIUS)
-            .flat_map(|dx| (-RENDER_RADIUS..=RENDER_RADIUS).map(move |dz| (pcx + dx, pcz + dz)))
+        let radius = self.render_radius;
+        let wanted: std::collections::HashSet<(i32, i32)> = (-radius..=radius)
+            .flat_map(|dx| (-radius..=radius).map(move |dz| (pcx + dx, pcz + dz)))
             .collect();
 
         // Descargar los que quedaron fuera del radio. Esto es barato (solo
@@ -705,14 +395,14 @@ impl State {
                         .find(|(coord, _)| *coord == (cx + dx, cz + dz))
                         .map(|(_, c)| c)
                 };
-                let neighborhood = mesher::ChunkNeighborhood {
+                let neighborhood = environment::mesher::ChunkNeighborhood {
                     center: &chunk,
                     neg_x: find(-1, 0),
                     pos_x: find(1, 0),
                     neg_z: find(0, -1),
                     pos_z: find(0, 1),
                 };
-                let mesh = mesher::generate_mesh(&neighborhood);
+                let mesh = environment::mesher::generate_mesh(&neighborhood);
 
                 // Si el receiver ya no existe (la ventana se cerró y State
                 // se destruyó) el send simplemente falla; no hay nada que
@@ -725,7 +415,7 @@ impl State {
     /// Recoge, como máximo `MAX_FINALIZED_CHUNKS_PER_FRAME` por llamada,
     /// los chunks que un hilo de fondo ya terminó de generar y mallear, y
     /// recién acá —en el hilo principal, único lugar donde es válido
-    /// usar `self.device`— sube esa malla a la GPU. Se llama todos los
+    /// usar `self.render.device`— sube esa malla a la GPU. Se llama todos los
     /// frames desde `update()`, no solo cuando el jugador cruza de chunk,
     /// para ir vaciando el channel de a poco en vez de todo de golpe.
     fn finalize_ready_chunks(&mut self) {
@@ -737,7 +427,7 @@ impl State {
 
             if !mesh.indices.is_empty() {
                 let (cx, cz) = coord;
-                let gpu_mesh = build_chunk_mesh(&self.device, cx, cz, &mesh);
+                let gpu_mesh = build_chunk_mesh(&self.render.device, cx, cz, &mesh);
                 self.chunk_meshes.insert(coord, gpu_mesh);
             }
             self.world.insert_loaded_chunk(coord.0, coord.1, chunk);
@@ -781,12 +471,13 @@ impl State {
     /// tenemos hoy de confirmar "sí, se copió" sin depender de un log
     /// que el usuario no está mirando en ese momento.
     fn render_crash_screen(&mut self, flash: bool) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+        let output = self.render.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
+            .render
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("crash_screen_encoder"),
@@ -827,20 +518,14 @@ impl State {
             });
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.render.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-            self.depth_texture_view = create_depth_texture(&self.device, &self.config);
-        }
+        self.render.resize(new_size);
     }
 
     fn update(&mut self) {
@@ -863,6 +548,13 @@ impl State {
         if look_dx != 0.0 || look_dy != 0.0 {
             self.camera.process_touch_look(look_dx, look_dy);
         }
+        // Estilo Minecraft: mantener el dedo apoyado en la zona de mirar
+        // (sin soltarlo) rompe el bloque apuntado en repetición, sin
+        // necesidad de un botón ROMPER separado. Ver `TouchController::
+        // poll_hold_break` y el comentario al principio de touch.rs.
+        if self.touch.poll_hold_break() {
+            self.handle_click(MouseButton::Left);
+        }
 
         if self.walk_mode {
             if self.camera.wants_jump() {
@@ -875,25 +567,58 @@ impl State {
             self.camera.update(dt);
         }
 
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let aspect = self.render.config.width as f32 / self.render.config.height.max(1) as f32;
         let view_proj = projection_matrix(aspect) * self.camera.view_matrix();
+
+        // Distancia de niebla en bloques (no en chunks): `render_radius`
+        // son chunks, así que la pasamos a bloques con CHUNK_SIZE_X para
+        // que `fog_end` caiga justo en (o un poco antes de) el borde
+        // donde los chunks dejan de cargarse. `fog_start` es un 65% de
+        // eso, para que la transición sea gradual y no un muro de niebla.
+        // Como es un cálculo relativo al radio actual, funciona igual de
+        // bien con radio 1 (niebla muy cerca, tapa el borde del mundo
+        // cargado) que con radio 128 (niebla lejos, solo un detalle de
+        // atmósfera en el horizonte).
+        //
+        // Si la niebla está apagada (fila "NIEBLA" en configuración),
+        // mandamos un umbral centinela bien por encima de cualquier
+        // distancia real del mundo, para que `fog_factor` en los
+        // shaders (mezcla hacia SKY_COLOR) quede siempre en 0 sin tener
+        // que tocar shader.wgsl/clouds_shader.wgsl con un flag aparte.
+        // Ojo: esto también apaga el desvanecido del borde de la capa de
+        // nubes (ver clouds_shader.wgsl), que reusa el mismo cálculo —
+        // es la contrapartida esperada de apagar la niebla "de verdad".
+        let (fog_start, fog_end) = if self.show_fog {
+            let fog_end = (self.render_radius * CHUNK_SIZE_X as i32) as f32;
+            (fog_end * FOG_START_FRACTION, fog_end)
+        } else {
+            const FOG_DISABLED_SENTINEL: f32 = 1.0e6;
+            (FOG_DISABLED_SENTINEL, FOG_DISABLED_SENTINEL)
+        };
+
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            camera_pos: self.camera.position.to_array(),
+            fog_start,
+            fog_color: SKY_COLOR,
+            fog_end,
+            time: [self.start_time.elapsed().as_secs_f32(), 0.0, 0.0, 0.0],
         };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.render.queue
+            .write_buffer(&self.render.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         self.update_chunk_streaming();
         self.finalize_ready_chunks();
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+        let output = self.render.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
+            .render
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("render_encoder"),
@@ -904,26 +629,30 @@ impl State {
         // ajustes encima del mundo congelado. En juego: mira + controles.
         let ui_vertices = if self.game_screen == GameScreen::Settings {
             ui_overlay::build_settings_screen(
-                self.size,
+                self.render.size,
                 self.show_fps,
                 self.walk_mode,
+                self.render_radius,
+                self.show_clouds,
+                self.show_fog,
             )
         } else {
-            let mut verts = ui_overlay::build_crosshair(self.size);
+            let mut verts = ui_overlay::build_crosshair(self.render.size);
             #[cfg(target_os = "android")]
             verts.extend(ui_overlay::build_touch_overlay(
                 &self.touch,
-                self.size,
+                self.render.size,
                 self.selected_block,
                 self.show_fps,
             ));
             // Contador de FPS en la esquina superior derecha.
             if self.show_fps {
-                verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.size));
+                verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.render.size));
             }
             verts
         };
         let ui_vertex_buffer = self
+            .render
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("ui_overlay_vertex_buffer"),
@@ -951,7 +680,7 @@ impl State {
             None
         } else {
             Some(
-                self.device
+                self.render.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("highlight_vertex_buffer"),
                         contents: bytemuck::cast_slice(&highlight_vertices),
@@ -968,16 +697,16 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.53,
-                            g: 0.81,
-                            b: 0.92,
+                            r: SKY_COLOR[0] as f64,
+                            g: SKY_COLOR[1] as f64,
+                            b: SKY_COLOR[2] as f64,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture_view,
+                    view: &self.render.depth_texture_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -988,8 +717,9 @@ impl State {
                 occlusion_query_set: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_pipeline(&self.render.render_pipeline);
+            render_pass.set_bind_group(0, &self.render.uniform_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.render.texture_atlas.bind_group, &[]);
 
             for mesh in self.chunk_meshes.values() {
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -1000,10 +730,24 @@ impl State {
             // Contorno del bloque apuntado: mismo bind group (view_proj)
             // que el terreno, porque dibuja en espacio de mundo real.
             if let Some(buffer) = &highlight_vertex_buffer {
-                render_pass.set_pipeline(&self.highlight_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_pipeline(&self.render.highlight_pipeline);
+                render_pass.set_bind_group(0, &self.render.uniform_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, buffer.slice(..));
                 render_pass.draw(0..highlight_vertices.len() as u32, 0..1);
+            }
+
+            // Capa de nubes: se dibuja después del terreno (para que el
+            // depth test pueda ocultarlas detrás de una montaña alta) y
+            // con alpha blending sobre lo ya pintado. Mismo bind group
+            // que el terreno; el shader recentra el quad en la cámara
+            // usando `camera_pos` de ese mismo uniform. Si el jugador
+            // apagó la fila "NUBES" en configuración, directamente no
+            // hacemos el draw call.
+            if self.show_clouds {
+                render_pass.set_pipeline(&self.render.clouds_pipeline);
+                render_pass.set_bind_group(0, &self.render.uniform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.render.cloud_vertex_buffer.slice(..));
+                render_pass.draw(0..self.render.cloud_num_vertices, 0..1);
             }
 
             // Overlay 2D (mira + controles táctiles) encima de todo (mismo
@@ -1011,39 +755,18 @@ impl State {
             // render_pipeline por requisito de wgpu, pero con
             // depth_compare: Always y depth_write_enabled: false, así que
             // no testea ni pisa el depth buffer y siempre queda visible).
-            render_pass.set_pipeline(&self.ui_pipeline);
+            render_pass.set_pipeline(&self.render.ui_pipeline);
             render_pass.set_vertex_buffer(0, ui_vertex_buffer.slice(..));
             render_pass.draw(0..ui_vertices.len() as u32, 0..1);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.render.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
     }
 }
 
-fn create_depth_texture(
-    device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
-) -> wgpu::TextureView {
-    let size = wgpu::Extent3d {
-        width: config.width.max(1),
-        height: config.height.max(1),
-        depth_or_array_layers: 1,
-    };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("depth_texture"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
-}
 
 /// Construye los buffers de GPU (vértices + índices) para un chunk,
 /// desplazando cada vértice a su posición de mundo según (cx, cz).
@@ -1053,7 +776,7 @@ fn build_chunk_mesh(
     device: &wgpu::Device,
     cx: i32,
     cz: i32,
-    mesh: &mesher::MeshData,
+    mesh: &environment::mesher::MeshData,
 ) -> ChunkMesh {
     let offset_x = (cx * CHUNK_SIZE_X as i32) as f32;
     let offset_z = (cz * CHUNK_SIZE_Z as i32) as f32;
@@ -1068,6 +791,8 @@ fn build_chunk_mesh(
             ],
             normal: v.normal,
             color: v.color,
+            uv: v.uv,
+            tile_origin: v.tile_origin,
         })
         .collect();
 
@@ -1353,7 +1078,7 @@ impl ApplicationHandler for App {
                             .unwrap_or(false);
                         match state.render_crash_screen(flashing) {
                             Ok(_) => {}
-                            Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                            Err(wgpu::SurfaceError::Lost) => state.resize(state.render.size),
                             Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
                             Err(e) => log::warn!("Error de render (pantalla de crash): {:?}", e),
                         }
@@ -1385,6 +1110,17 @@ impl ApplicationHandler for App {
         // vez de dejar que se propague hacia winit.
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match event {
+                WindowEvent::Focused(true) => {
+                    // Abrir el cajón de notificaciones y cerrarlo (o
+                    // cualquier diálogo/overlay del sistema) NO pasa por
+                    // `resumed()`: la Activity nunca llega a pausarse del
+                    // todo, solo pierde y recupera el foco de la ventana.
+                    // Android además resetea los flags de inmersivo cada
+                    // vez que la ventana recupera el foco, así que hay
+                    // que volver a pedirlos acá, no solo en `resumed()`.
+                    #[cfg(target_os = "android")]
+                    immersive::apply_immersive_fullscreen();
+                }
                 WindowEvent::CloseRequested => {
                     let saved = state.world.save_dirty_chunks();
                     if saved > 0 {
@@ -1419,17 +1155,18 @@ impl ApplicationHandler for App {
                         // del menú de ajustes solamente.
                         state.touch.on_touch_settings(
                             touch,
-                            state.size,
+                            state.render.size,
                             state.show_fps,
                             state.walk_mode,
+                            state.show_clouds,
+                            state.show_fog,
                         )
                     } else {
                         // En juego: procesamos controles táctiles normales.
-                        state.touch.on_touch_game(touch, state.size)
+                        state.touch.on_touch_game(touch, state.render.size)
                     };
                     if let Some(action) = action {
                         match action {
-                            TouchAction::Break => state.handle_click(MouseButton::Left),
                             TouchAction::Place => state.handle_click(MouseButton::Right),
                             TouchAction::SelectBlock(n) => {
                                 state.selected_block = match n {
@@ -1457,6 +1194,20 @@ impl ApplicationHandler for App {
                                         state.camera.position - glam::Vec3::new(0.0, 1.6, 0.0);
                                     state.player.velocity = glam::Vec3::ZERO;
                                 }
+                            }
+                            TouchAction::DecreaseRenderRadius => {
+                                state.render_radius =
+                                    (state.render_radius - 1).max(MIN_RENDER_RADIUS);
+                            }
+                            TouchAction::IncreaseRenderRadius => {
+                                state.render_radius =
+                                    (state.render_radius + 1).min(MAX_RENDER_RADIUS);
+                            }
+                            TouchAction::ToggleClouds => {
+                                state.show_clouds = !state.show_clouds;
+                            }
+                            TouchAction::ToggleFog => {
+                                state.show_fog = !state.show_fog;
                             }
                         }
                     }
@@ -1524,7 +1275,7 @@ impl ApplicationHandler for App {
                     state.update();
                     match state.render() {
                         Ok(_) => {}
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                        Err(wgpu::SurfaceError::Lost) => state.resize(state.render.size),
                         Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
                         Err(e) => log::warn!("Error de render: {:?}", e),
                     }

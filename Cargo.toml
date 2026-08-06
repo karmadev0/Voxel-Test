@@ -27,6 +27,11 @@ env_logger = "0.11"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+# Decodifica el atlas de texturas de bloques (assets/textures/atlas.png,
+# ver textures/loader.rs). default-features = false + solo "png" porque
+# es el único formato que usamos: evita compilar decoders de jpeg/gif/etc
+# que no hacen falta y que en Android alargan el build sin necesidad.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Solo se compilan/descargan cuando el target es Android: el glue de
 # NativeActivity (vía el feature de winit) y un logger que manda los
@@ -84,6 +89,14 @@ version = 0x400000 # Vulkan 1.0
 
 [package.metadata.android.application]
 label = "Voxel Engine"
+# Fullscreen desde el arranque de la Activity (antes de que el primer
+# `resumed()` llegue a pedir el modo inmersivo por JNI, ver
+# src/immersive.rs): sin esto, aunque el JNI funcione bien, hay un
+# instante al abrir la app donde se alcanza a ver la barra de estado. No
+# va en el workflow de CI (android.yml) porque no es un paso del build,
+# es un atributo del <application> del manifest que cargo-apk genera a
+# partir de este Cargo.toml.
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 
 # Fuerza horizontal desde que arranca la Activity (sin esto Android la abre
 # en "unspecified", que en la mayoría de los celulares es vertical).
