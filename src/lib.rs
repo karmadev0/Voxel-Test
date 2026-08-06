@@ -835,7 +835,25 @@ fn android_main(app: AndroidApp) {
     // `crash::install` igual sigue funcionando, solo que sin poder
     // escribir el archivo (el reporte queda en logcat).
     let crash_dir = app.external_data_path().or_else(|| app.internal_data_path());
-    crash::install(crash_dir);
+    crash::install(crash_dir.clone());
+    // Además del panic hook (que solo ve panics de Rust): instalamos
+    // manejadores de señal para crashes nativos de verdad (SIGSEGV,
+    // SIGABRT, etc. — ver la explicación larga en platform/crash.rs).
+    // Sin esto, un crash nativo (el sospechoso más probable de "se
+    // cierra sin dejar rastro") no deja ni archivo ni pantalla roja,
+    // porque nunca pasa por ninguno de los dos mecanismos de arriba.
+    // Antes de instalar los manejadores de señal de ESTA corrida (para
+    // no pisar/leer un native_crash.txt a medio escribir por ellos),
+    // preguntamos si la corrida ANTERIOR del proceso murió mal: primero
+    // vía ApplicationExitInfo (API 30+, lo pregunta el propio Android),
+    // si no vía el archivo que dejó nuestro manejador de señal (ver
+    // crash.rs). Si hay algo, arrancamos directo en pantalla de crash —
+    // sin esto, un crash nativo que mató el proceso quedaba sin ninguna
+    // forma de verlo/copiarlo en el dispositivo (el proceso ya no existe
+    // para dibujar nada), que es justo el síntoma original.
+    let startup_crash = crash::check_previous_run_crash(crash_dir.as_deref());
+
+    crash::install_native_signal_handlers(crash_dir.as_deref());
 
     let event_loop = match winit::event_loop::EventLoopBuilder::new()
         .with_android_app(app)
@@ -873,7 +891,7 @@ fn android_main(app: AndroidApp) {
         }
     };
 
-    run(event_loop);
+    run(event_loop, startup_crash);
 
     // Mismo motivo que arriba: usamos _exit en vez de std::process::exit
     // para no disparar la limpieza global desde este hilo.
@@ -890,7 +908,9 @@ pub fn run_desktop() {
     // los logs se descartan en silencio).
     crash::install(None);
     let event_loop = EventLoop::new().unwrap();
-    run(event_loop);
+    // En desktop no hay chequeo de "corrida anterior" (ver
+    // crash::check_previous_run_crash): siempre arranca en modo normal.
+    run(event_loop, None);
 }
 
 /// Estado de la app para el nuevo modelo de `winit` 0.30+ (`ApplicationHandler`,
@@ -1340,8 +1360,23 @@ impl ApplicationHandler for App {
 /// Loop principal, común a desktop y Android. Arranca el `ApplicationHandler`
 /// de arriba, que reemplaza al closure único que usaba `event_loop.run(...)`
 /// en winit 0.29 (API vieja, deprecada y quitada en 0.30+).
-pub fn run(event_loop: EventLoop<()>) {
+///
+/// `startup_crash`: si viene `Some(mensaje_corto)` (solo puede pasar en
+/// Android — ver `crash::check_previous_run_crash`), el `App` arranca YA
+/// marcado como crasheado, mostrando la pantalla roja desde el primer
+/// frame en vez del juego. `resumed()` igual crea la ventana/`State`
+/// normalmente (hace falta una superficie donde dibujar la pantalla de
+/// crash); es `window_event` el que, al ver `self.crashed`, se desvía a
+/// `render_crash_screen()` en vez de la lógica normal del juego — el
+/// mismo mecanismo que ya se usa para un panic atrapado en esta misma
+/// corrida, reutilizado acá para uno de la corrida anterior.
+pub fn run(event_loop: EventLoop<()>, startup_crash: Option<String>) {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();
+    if let Some(short_message) = startup_crash {
+        app.crashed = true;
+        app.crash_short_message = Some(short_message);
+    }
     event_loop.run_app(&mut app).unwrap();
 }
+
