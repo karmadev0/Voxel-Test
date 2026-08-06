@@ -64,6 +64,16 @@ version = 0x400000 # Vulkan 1.0
 [package.metadata.android.application]
 label = "Voxel Engine"
 
+# cargo-apk ya no genera sola una keystore de debug para builds
+# --release (sí lo hacía en versiones viejas): hay que apuntarle a una
+# explícitamente. El workflow de CI genera este archivo con `keytool`
+# antes de compilar (ver android.yml), con las credenciales estándar de
+# debug de Android (alias/clave "android..."), suficiente para instalar
+# y probar en tu celular — no es una clave de publicación en Play Store.
+[package.metadata.android.signing.release]
+path = "debug.keystore"
+keystore_password = "android"
+
 # panic = "abort" no linkea bien en el cdylib de Android (el runtime de
 # NDK espera poder desenrollar el stack); "unwind" funciona en ambas
 # plataformas con un costo de rendimiento despreciable para este engine.
