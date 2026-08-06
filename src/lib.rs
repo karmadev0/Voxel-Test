@@ -13,6 +13,7 @@ mod camera;
 mod chunk;
 mod crash;
 mod highlight;
+mod immersive;
 mod mesher;
 mod player;
 mod touch;
@@ -137,6 +138,10 @@ struct State {
     fps_frame_count: u32,
     fps_timer: Instant,
     pub current_fps: f32,
+    // Si se dibuja o no el contador de FPS en pantalla. Se puede
+    // prender/apagar desde el panel de configuración (botón de engranaje
+    // arriba a la derecha en Android); por defecto arranca visible.
+    show_fps: bool,
 }
 
 impl State {
@@ -536,6 +541,7 @@ impl State {
             fps_frame_count: 0,
             fps_timer: Instant::now(),
             current_fps: 0.0,
+            show_fps: true,
             current_player_chunk: (0, 0),
             chunk_loader,
             pending_chunks: std::collections::HashSet::new(),
@@ -884,7 +890,15 @@ impl State {
             &self.touch,
             self.size,
             self.selected_block,
+            self.show_fps,
         ));
+        // Contador de FPS en la esquina superior derecha. Usa el último
+        // promedio calculado por `tick_fps` (se actualiza 1 vez por
+        // segundo), no el FPS instantáneo del frame actual. Se puede
+        // apagar desde el panel de configuración (ver ui_overlay.rs).
+        if self.show_fps {
+            ui_vertices.extend(ui_overlay::build_fps_counter(self.current_fps, self.size));
+        }
         let ui_vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1213,12 +1227,16 @@ impl ApplicationHandler for App {
                 let new_state = pollster::block_on(State::new(win.clone()));
                 self.window = Some(win);
                 self.state = Some(new_state);
+                #[cfg(target_os = "android")]
+                immersive::apply_immersive_fullscreen();
             } else if self.state.is_none() {
                 // Android destruyó la superficie al pasar a segundo plano
                 // (ver `suspended()` más abajo) y ahora, al volver, nos avisa
                 // que hay una superficie nueva.
                 let win = self.window.as_ref().unwrap();
                 self.state = Some(pollster::block_on(State::new(win.clone())));
+                #[cfg(target_os = "android")]
+                immersive::apply_immersive_fullscreen();
             }
         }));
 
@@ -1382,6 +1400,14 @@ impl ApplicationHandler for App {
                                     2 => BlockType::Dirt,
                                     _ => BlockType::Stone,
                                 };
+                            }
+                            // El propio TouchController ya guarda si el
+                            // panel de configuración está abierto o
+                            // cerrado (`settings_open()`); acá no hace
+                            // falta hacer nada más.
+                            TouchAction::ToggleSettings => {}
+                            TouchAction::ToggleFps => {
+                                state.show_fps = !state.show_fps;
                             }
                         }
                     }
