@@ -5,6 +5,7 @@
 /// en vez de re-generar todo el mundo.
 
 use crate::chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
+use crate::mesher;
 use crate::worldgen::WorldGenerator;
 use glam::Vec3;
 use std::collections::{HashMap, HashSet};
@@ -156,6 +157,42 @@ impl World {
             Some(chunk) => chunk.get(lx, ly, lz),
             None => BlockType::Air, // chunk no generado todavía => se trata como aire
         }
+    }
+
+    /// Arma el `ChunkNeighborhood` de (cx, cz): el chunk pedido más
+    /// referencias a los 4 vecinos en X/Z que ya estén cargados en
+    /// memoria (los que no estén cargados quedan en `None`, y el mesher
+    /// los trata como aire — lo mismo que pasaba antes en todos los
+    /// bordes, ahora limitado solo a bordes con el mundo todavía sin
+    /// cargar del todo). Devuelve `None` si el chunk pedido ni siquiera
+    /// está cargado.
+    pub fn chunk_neighborhood(&self, cx: i32, cz: i32) -> Option<mesher::ChunkNeighborhood<'_>> {
+        let center = self.chunks.get(&(cx, cz))?;
+        Some(mesher::ChunkNeighborhood {
+            center,
+            neg_x: self.chunks.get(&(cx - 1, cz)),
+            pos_x: self.chunks.get(&(cx + 1, cz)),
+            neg_z: self.chunks.get(&(cx, cz - 1)),
+            pos_z: self.chunks.get(&(cx, cz + 1)),
+        })
+    }
+
+    /// Genera el `MeshData` de (cx, cz) con culling consciente de sus
+    /// vecinos ya cargados (ver `chunk_neighborhood`). Punto de entrada
+    /// único usado por la carga inicial, el re-mallado tras romper/
+    /// colocar, y el re-mallado de vecinos tras el streaming — para no
+    /// repetir la misma lógica de "armar vecindario + mallear" en cada
+    /// lugar que necesita un mesh actualizado.
+    pub fn generate_chunk_mesh(&self, cx: i32, cz: i32) -> Option<mesher::MeshData> {
+        self.chunk_neighborhood(cx, cz)
+            .map(|nb| mesher::generate_mesh(&nb))
+    }
+
+    /// Coordenadas de los 4 vecinos directos (X/Z) de un chunk, sin
+    /// diagonales — el greedy meshing nunca necesita vecinos diagonales
+    /// (ver comentario en `ChunkNeighborhood`).
+    pub fn direct_neighbors(cx: i32, cz: i32) -> [(i32, i32); 4] {
+        [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)]
     }
 
     /// Coloca/rompe un bloque. Devuelve la lista de chunks que hay que

@@ -15,6 +15,70 @@
 use crate::chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
 use bytemuck::{Pod, Zeroable};
 
+/// Fase 5: antes, el mesh de un chunk solo miraba sus propios bloques —
+/// en el borde con un chunk vecino, ese vecino se trataba siempre como
+/// aire, así que quedaban caras de más dibujadas ahí (invisibles para el
+/// jugador, pero trabajo de GPU desperdiciado). `ChunkNeighborhood` junta
+/// el chunk que se está malleando con referencias a sus 4 vecinos en X/Z
+/// (si están cargados) y resuelve los lookups fuera de rango consultando
+/// al vecino correcto en vez de asumir aire. No hace falta un vecino
+/// "diagonal": el greedy meshing sweep nunca se mueve más de un eje a la
+/// vez, así que un lookup fuera de rango cambia una sola coordenada por
+/// vez (nunca X y Z a la vez).
+pub struct ChunkNeighborhood<'a> {
+    pub center: &'a Chunk,
+    pub neg_x: Option<&'a Chunk>,
+    pub pos_x: Option<&'a Chunk>,
+    pub neg_z: Option<&'a Chunk>,
+    pub pos_z: Option<&'a Chunk>,
+}
+
+impl<'a> ChunkNeighborhood<'a> {
+    /// Un chunk "solo", sin vecinos conocidos (equivalente al comportamiento
+    /// de antes de la Fase 5: bordes tratados como aire). Útil para tests
+    /// o para mallear un chunk aislado sin tener que armar un `World`.
+    pub fn isolated(center: &'a Chunk) -> Self {
+        Self {
+            center,
+            neg_x: None,
+            pos_x: None,
+            neg_z: None,
+            pos_z: None,
+        }
+    }
+
+    fn get(&self, x: i32, y: i32, z: i32) -> BlockType {
+        if y < 0 || y >= CHUNK_SIZE_Y as i32 {
+            return BlockType::Air;
+        }
+        if x < 0 {
+            return self
+                .neg_x
+                .map(|c| c.get(CHUNK_SIZE_X as i32 + x, y, z))
+                .unwrap_or(BlockType::Air);
+        }
+        if x >= CHUNK_SIZE_X as i32 {
+            return self
+                .pos_x
+                .map(|c| c.get(x - CHUNK_SIZE_X as i32, y, z))
+                .unwrap_or(BlockType::Air);
+        }
+        if z < 0 {
+            return self
+                .neg_z
+                .map(|c| c.get(x, y, CHUNK_SIZE_Z as i32 + z))
+                .unwrap_or(BlockType::Air);
+        }
+        if z >= CHUNK_SIZE_Z as i32 {
+            return self
+                .pos_z
+                .map(|c| c.get(x, y, z - CHUNK_SIZE_Z as i32))
+                .unwrap_or(BlockType::Air);
+        }
+        self.center.get(x, y, z)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct Vertex {
@@ -57,13 +121,16 @@ pub struct MeshData {
 
 /// Genera la malla completa de un chunk recorriendo los 3 ejes, en las
 /// 2 direcciones cada uno (positiva y negativa) = 6 direcciones totales.
-pub fn generate_mesh(chunk: &Chunk) -> MeshData {
+/// `neighborhood` incluye el chunk a mallear y, si están disponibles, sus
+/// vecinos en X/Z — así las caras en el borde se cullean de verdad en vez
+/// de asumir aire del otro lado.
+pub fn generate_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
     for axis in 0..3 {
         for backface in [false, true] {
-            greedy_sweep(chunk, axis, backface, &mut vertices, &mut indices);
+            greedy_sweep(neighborhood, axis, backface, &mut vertices, &mut indices);
         }
     }
 
@@ -77,7 +144,7 @@ fn dims() -> [i32; 3] {
 /// Barre el chunk a lo largo de `axis`, capa por capa, fusionando caras
 /// del mismo tipo de bloque en rectángulos (greedy meshing 2D por capa).
 fn greedy_sweep(
-    chunk: &Chunk,
+    neighborhood: &ChunkNeighborhood,
     axis: usize,
     backface: bool,
     vertices: &mut Vec<Vertex>,
@@ -105,10 +172,10 @@ fn greedy_sweep(
         while x[v] < d[v] {
             x[u] = 0;
             while x[u] < d[u] {
-                let a = get_block(chunk, x[0], x[1], x[2]);
+                let a = get_block(neighborhood, x[0], x[1], x[2]);
                 let mut xb = x;
                 xb[axis] += 1;
-                let b = get_block(chunk, xb[0], xb[1], xb[2]);
+                let b = get_block(neighborhood, xb[0], xb[1], xb[2]);
 
                 mask[n] = if a.is_solid() != b.is_solid() {
                     if backface {
@@ -185,8 +252,8 @@ fn greedy_sweep(
     }
 }
 
-fn get_block(chunk: &Chunk, x: i32, y: i32, z: i32) -> BlockType {
-    chunk.get(x, y, z)
+fn get_block(neighborhood: &ChunkNeighborhood, x: i32, y: i32, z: i32) -> BlockType {
+    neighborhood.get(x, y, z)
 }
 
 #[allow(clippy::too_many_arguments)]

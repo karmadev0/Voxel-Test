@@ -36,7 +36,7 @@ impl BlockType {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Chunk {
     pub blocks: Vec<BlockType>, // indexado con index(x,y,z)
 }

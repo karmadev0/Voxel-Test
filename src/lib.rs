@@ -12,6 +12,7 @@
 mod camera;
 mod chunk;
 mod crash;
+mod highlight;
 mod mesher;
 mod player;
 mod touch;
@@ -20,7 +21,7 @@ mod world;
 mod worldgen;
 
 use camera::{projection_matrix, Camera};
-use chunk::{BlockType, CHUNK_SIZE_X, CHUNK_SIZE_Z};
+use chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Z};
 use glam::Mat4;
 use mesher::Vertex;
 use player::Player;
@@ -85,13 +86,15 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
 
     render_pipeline: wgpu::RenderPipeline,
-    // Pipeline aparte para el overlay táctil (ver ui_overlay.rs): sin
-    // depth test (siempre se dibuja encima de todo) y con alpha blending
-    // (traslúcido). Solo existe en Android — en desktop no hay
-    // WindowEvent::Touch, así que ni el pipeline ni el buffer de vértices
-    // del overlay tendrían para qué existir.
-    #[cfg(target_os = "android")]
+    // Pipeline del overlay 2D: sin depth test contra el mundo (siempre se
+    // dibuja encima), con alpha blending. En Android dibuja los controles
+    // táctiles; en las dos plataformas dibuja la mira central (Fase 5).
     ui_pipeline: wgpu::RenderPipeline,
+    // Pipeline del contorno wireframe que marca el bloque apuntado
+    // (Fase 5, ver highlight.rs). A diferencia de ui_pipeline, este SÍ
+    // testea profundidad contra el mundo (para quedar oculto si hay algo
+    // por delante), pero no la escribe.
+    highlight_pipeline: wgpu::RenderPipeline,
     depth_texture_view: wgpu::TextureView,
 
     uniform_buffer: wgpu::Buffer,
@@ -337,8 +340,8 @@ impl State {
             multiview: None,
         });
 
-        // --- Pipeline del overlay táctil (solo Android) ---
-        #[cfg(target_os = "android")]
+        // --- Pipeline del overlay 2D: mira central (ambas plataformas) +
+        // controles táctiles (solo Android) ---
         let ui_pipeline = {
             let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ui_shader"),
@@ -407,6 +410,64 @@ impl State {
             })
         };
 
+        // --- Pipeline del contorno del bloque apuntado (Fase 5) ---
+        // Reusa `uniform_bind_group_layout` (view_proj) porque dibuja en
+        // espacio de mundo real, no en NDC como el overlay 2D — necesita
+        // la misma transformación de cámara que el terreno.
+        let highlight_pipeline = {
+            let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("highlight_shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("highlight_shader.wgsl").into()),
+            });
+            let highlight_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("highlight_pipeline_layout"),
+                    bind_group_layouts: &[&uniform_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("highlight_pipeline"),
+                layout: Some(&highlight_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &highlight_shader,
+                    entry_point: "vs_main",
+                    buffers: &[highlight::HighlightVertex::desc()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &highlight_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                // A diferencia del overlay 2D: SÍ testea profundidad
+                // contra el mundo (para que el contorno quede oculto
+                // detrás de terreno que lo tape), pero no la escribe —
+                // así no interfiere con el depth de los chunks dibujados
+                // después de él si el orden cambiara en algún momento.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        };
+
         // --- Generación de mundo (paralela con rayon) ---
         log::info!("Generando terreno...");
         let mut world = World::new(1337);
@@ -414,12 +475,20 @@ impl State {
 
         // Malleamos (greedy meshing) todos los chunks generados, en
         // paralelo, aprovechando los 2 núcleos / 2 hilos del Celeron N4000.
+        // Como para la carga inicial TODOS los chunks del radio ya están
+        // en `world.chunks` antes de mallear ninguno, cada chunk ve a sus
+        // vecinos reales (Fase 5: culling consciente de vecinos) excepto
+        // en el borde exterior del radio, donde no hay más remedio que
+        // tratar "fuera del mundo cargado" como aire.
         let coords: Vec<(i32, i32)> = world.chunks.keys().copied().collect();
         let mesh_data: Vec<((i32, i32), mesher::MeshData)> = coords
             .par_iter()
             .map(|&(cx, cz)| {
-                let chunk = world.chunks.get(&(cx, cz)).unwrap();
-                (( cx, cz), mesher::generate_mesh(chunk))
+                let mesh = world.generate_chunk_mesh(cx, cz).unwrap_or(mesher::MeshData {
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                });
+                ((cx, cz), mesh)
             })
             .collect();
 
@@ -450,8 +519,8 @@ impl State {
             config,
             size,
             render_pipeline,
-            #[cfg(target_os = "android")]
             ui_pipeline,
+            highlight_pipeline,
             depth_texture_view,
             uniform_buffer,
             uniform_bind_group,
@@ -492,20 +561,17 @@ impl State {
     }
 
     /// Re-genera el mesh de un chunk (o lo borra del mapa si quedó vacío)
-    /// y actualiza `chunk_meshes`. Se llama solo sobre los chunks que
-    /// realmente cambiaron tras romper/colocar un bloque — no todo el mundo.
+    /// y actualiza `chunk_meshes`. Se llama sobre los chunks que
+    /// realmente cambiaron tras romper/colocar un bloque, y también sobre
+    /// vecinos que necesitan actualizar su culling de borde tras el
+    /// streaming (ver `finalize_ready_chunks`) — no todo el mundo.
     fn remesh_chunk(&mut self, cx: i32, cz: i32) {
-        match self.world.chunks.get(&(cx, cz)) {
-            Some(chunk) => {
-                let mesh = mesher::generate_mesh(chunk);
-                if mesh.indices.is_empty() {
-                    self.chunk_meshes.remove(&(cx, cz));
-                } else {
-                    let gpu_mesh = build_chunk_mesh(&self.device, cx, cz, &mesh);
-                    self.chunk_meshes.insert((cx, cz), gpu_mesh);
-                }
+        match self.world.generate_chunk_mesh(cx, cz) {
+            Some(mesh) if !mesh.indices.is_empty() => {
+                let gpu_mesh = build_chunk_mesh(&self.device, cx, cz, &mesh);
+                self.chunk_meshes.insert((cx, cz), gpu_mesh);
             }
-            None => {
+            _ => {
                 self.chunk_meshes.remove(&(cx, cz));
             }
         }
@@ -595,9 +661,40 @@ impl State {
             self.pending_chunks.insert((cx, cz));
             let loader = self.chunk_loader.clone();
             let tx = self.chunk_result_tx.clone();
+
+            // Fase 5: le mandamos al hilo de fondo una foto de los vecinos
+            // que YA están cargados en este instante (clonar un Chunk es
+            // barato: ~16 KB, nada comparado con generar ruido Perlin o
+            // leer un archivo). Así el mesh que vuelve por el channel ya
+            // viene con culling correcto contra esos vecinos, en vez de
+            // tratarlos como aire y tener que corregir todo después. Si
+            // un vecino llega a cargarse recién DESPUÉS de esta foto, el
+            // paso de abajo en `finalize_ready_chunks` se encarga de
+            // corregirlo re-mallando en el momento en que ese vecino
+            // exista de verdad.
+            let neighbor_snapshots: Vec<((i32, i32), Chunk)> = World::direct_neighbors(cx, cz)
+                .into_iter()
+                .filter_map(|coord| self.world.chunks.get(&coord).map(|c| (coord, c.clone())))
+                .collect();
+
             rayon::spawn(move || {
                 let chunk = loader.load_or_generate(cx, cz);
-                let mesh = mesher::generate_mesh(&chunk);
+
+                let find = |dx: i32, dz: i32| {
+                    neighbor_snapshots
+                        .iter()
+                        .find(|(coord, _)| *coord == (cx + dx, cz + dz))
+                        .map(|(_, c)| c)
+                };
+                let neighborhood = mesher::ChunkNeighborhood {
+                    center: &chunk,
+                    neg_x: find(-1, 0),
+                    pos_x: find(1, 0),
+                    neg_z: find(0, -1),
+                    pos_z: find(0, 1),
+                };
+                let mesh = mesher::generate_mesh(&neighborhood);
+
                 // Si el receiver ya no existe (la ventana se cerró y State
                 // se destruyó) el send simplemente falla; no hay nada que
                 // limpiar del lado del hilo de fondo.
@@ -625,6 +722,30 @@ impl State {
                 self.chunk_meshes.insert(coord, gpu_mesh);
             }
             self.world.insert_loaded_chunk(coord.0, coord.1, chunk);
+
+            // Fase 5: el mesh que acabamos de subir ya tiene culling
+            // correcto contra los vecinos que existían en el momento en
+            // que se pidió (ver `update_chunk_streaming`). Pero si algún
+            // vecino YA estaba cargado y mallado ANTES de eso, ese vecino
+            // todavía tiene su cara del borde dibujada de más (la mandó a
+            // mallear cuando este chunk nuevo todavía no existía). Ahora
+            // que los dos están en `world.chunks`, lo corregimos
+            // re-mallando esos vecinos ya cargados — síncrono, pero
+            // barato: como mucho 4 chunks, cada uno un greedy meshing
+            // normal, nada distinto en costo a un romper/colocar bloque.
+            for (ncx, ncz) in World::direct_neighbors(coord.0, coord.1) {
+                let already_loaded = self.world.chunks.contains_key(&(ncx, ncz));
+                let in_flight = self.pending_chunks.contains(&(ncx, ncz));
+                if already_loaded && !in_flight {
+                    // Ese vecino ya estaba en memoria antes de que este
+                    // chunk llegara, así que su mesh puede tener una cara
+                    // de más en el borde compartido. Si en cambio está en
+                    // vuelo (in_flight), cuando llegue va a usar una foto
+                    // de vecinos que ya incluye a este chunk, así que no
+                    // hace falta tocarlo acá.
+                    self.remesh_chunk(ncx, ncz);
+                }
+            }
         }
     }
 
@@ -752,13 +873,18 @@ impl State {
                 label: Some("render_encoder"),
             });
 
-        // El buffer del overlay táctil se crea acá afuera (no dentro del
-        // bloque del render_pass) porque tiene que vivir al menos tanto
-        // como el `render_pass`, que le va a tomar un préstamo prestado
-        // más abajo con `set_vertex_buffer`.
+        // Geometría del overlay 2D de este frame: la mira central siempre,
+        // más los controles táctiles si estamos en Android. Se arma acá
+        // afuera (no dentro del bloque del render_pass) porque el buffer
+        // tiene que vivir al menos tanto como el `render_pass`, que le
+        // toma un préstamo más abajo con `set_vertex_buffer`.
+        let mut ui_vertices = ui_overlay::build_crosshair(self.size);
         #[cfg(target_os = "android")]
-        let ui_vertices = ui_overlay::build_touch_overlay(&self.touch, self.size, self.selected_block);
-        #[cfg(target_os = "android")]
+        ui_vertices.extend(ui_overlay::build_touch_overlay(
+            &self.touch,
+            self.size,
+            self.selected_block,
+        ));
         let ui_vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -766,6 +892,35 @@ impl State {
                 contents: bytemuck::cast_slice(&ui_vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+
+        // Contorno del bloque apuntado (Fase 5): mismo raycast DDA que
+        // usa `handle_click`, pero solo para saber qué dibujar, sin tocar
+        // el mundo. Si no hay nada al alcance (`REACH`), el buffer queda
+        // vacío y el draw call de abajo no dibuja nada (0 vértices).
+        let highlight_vertices: Vec<highlight::HighlightVertex> = raycast(
+            &self.world,
+            self.camera.position,
+            self.camera.view_direction(),
+            REACH,
+        )
+        .map(|hit| highlight::build_block_outline(hit.block_pos))
+        .unwrap_or_default();
+        // Ojo: un buffer de 0 bytes no es válido en todos los backends de
+        // wgpu (algunos lo rechazan en tiempo de validación). Si no hay
+        // nada al alcance, directamente no creamos el buffer ni el draw
+        // call de abajo, en vez de mandar un buffer vacío.
+        let highlight_vertex_buffer = if highlight_vertices.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("highlight_vertex_buffer"),
+                        contents: bytemuck::cast_slice(&highlight_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+            )
+        };
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -804,17 +959,23 @@ impl State {
                 render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
             }
 
-            // Overlay táctil encima de todo (mismo render pass, mismo
-            // formato de depth attachment que render_pipeline por
-            // requisito de wgpu, pero con depth_compare: Always y
-            // depth_write_enabled: false, así que no testea ni pisa el
-            // depth buffer del terreno y siempre queda visible).
-            #[cfg(target_os = "android")]
-            {
-                render_pass.set_pipeline(&self.ui_pipeline);
-                render_pass.set_vertex_buffer(0, ui_vertex_buffer.slice(..));
-                render_pass.draw(0..ui_vertices.len() as u32, 0..1);
+            // Contorno del bloque apuntado: mismo bind group (view_proj)
+            // que el terreno, porque dibuja en espacio de mundo real.
+            if let Some(buffer) = &highlight_vertex_buffer {
+                render_pass.set_pipeline(&self.highlight_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, buffer.slice(..));
+                render_pass.draw(0..highlight_vertices.len() as u32, 0..1);
             }
+
+            // Overlay 2D (mira + controles táctiles) encima de todo (mismo
+            // render pass, mismo formato de depth attachment que
+            // render_pipeline por requisito de wgpu, pero con
+            // depth_compare: Always y depth_write_enabled: false, así que
+            // no testea ni pisa el depth buffer y siempre queda visible).
+            render_pass.set_pipeline(&self.ui_pipeline);
+            render_pass.set_vertex_buffer(0, ui_vertex_buffer.slice(..));
+            render_pass.draw(0..ui_vertices.len() as u32, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -986,6 +1147,12 @@ struct App {
     // para mostrar en el título de la ventana sin tener que ir a leer el
     // archivo.
     crashed: bool,
+    // Se pone en true si la propia pantalla de crash vuelve a panickear
+    // (ver el fix en window_event: esa rama ahora también está envuelta
+    // en catch_unwind). En ese punto ya no intentamos redibujar nada más
+    // — el log del primer crash, que es el que importa, ya se escribió a
+    // disco/logcat antes de llegar hasta acá.
+    double_crashed: bool,
     crash_short_message: Option<String>,
     // Instante hasta el cual `render_crash_screen` debe mostrar el color
     // de "copiado" en vez del rojo normal (ver comentario de `flash` en
@@ -1089,60 +1256,85 @@ impl ApplicationHandler for App {
             // pasó. Solo dejamos: cerrar la ventana, redibujar la
             // pantalla roja, cambiarle el tamaño si hace falta, y copiar
             // el log (tecla C en desktop, tocar la pantalla en Android).
-            match event {
-                WindowEvent::CloseRequested => event_loop.exit(),
-                WindowEvent::Resized(new_size) => state.resize(new_size),
-                WindowEvent::KeyboardInput {
-                    event: key_event, ..
-                } => {
-                    if key_event.state == ElementState::Pressed {
-                        if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) =
-                            key_event.physical_key
-                        {
-                            if crash::copy_last_crash_to_clipboard() {
-                                log::info!("Log de crash copiado al portapapeles.");
-                                self.crash_copy_flash_until =
-                                    Some(Instant::now() + Duration::from_millis(700));
+            //
+            // TODO arreglado: esta rama entera va envuelta en catch_unwind
+            // igual que la rama normal de abajo. Antes, si la propia
+            // pantalla de crash volvía a panickear (por ejemplo porque lo
+            // que rompió el primer panic dejó al Device/Surface en un
+            // estado inválido), ese segundo panic no tenía red — se
+            // propagaba sin filtro y tiraba abajo el proceso entero,
+            // anulando todo el propósito de este sistema. Si vuelve a
+            // panickear acá adentro, dejamos de intentar redibujar nada
+            // (double_crashed) en vez de arriesgar un tercer intento.
+            if self.double_crashed {
+                return;
+            }
+
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match event {
+                    WindowEvent::CloseRequested => event_loop.exit(),
+                    WindowEvent::Resized(new_size) => state.resize(new_size),
+                    WindowEvent::KeyboardInput {
+                        event: key_event, ..
+                    } => {
+                        if key_event.state == ElementState::Pressed {
+                            if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) =
+                                key_event.physical_key
+                            {
+                                if crash::copy_last_crash_to_clipboard() {
+                                    log::info!("Log de crash copiado al portapapeles.");
+                                    self.crash_copy_flash_until =
+                                        Some(Instant::now() + Duration::from_millis(700));
+                                }
                             }
                         }
                     }
-                }
-                // Solo llega en Android (desktop no genera eventos de
-                // touch): tocar en cualquier parte de la pantalla de
-                // crash copia el log. Se dispara en `Started` y no en
-                // cada `Moved`, para que no haga falta un tap perfecto
-                // ni se repita todo el rato mientras el dedo sigue
-                // apoyado.
-                WindowEvent::Touch(touch)
-                    if touch.phase == winit::event::TouchPhase::Started =>
-                {
-                    if crash::copy_last_crash_to_clipboard() {
-                        log::info!("Log de crash copiado al portapapeles.");
-                        self.crash_copy_flash_until =
-                            Some(Instant::now() + Duration::from_millis(700));
+                    // Solo llega en Android (desktop no genera eventos de
+                    // touch): tocar en cualquier parte de la pantalla de
+                    // crash copia el log. Se dispara en `Started` y no en
+                    // cada `Moved`, para que no haga falta un tap perfecto
+                    // ni se repita todo el rato mientras el dedo sigue
+                    // apoyado.
+                    WindowEvent::Touch(touch)
+                        if touch.phase == winit::event::TouchPhase::Started =>
+                    {
+                        if crash::copy_last_crash_to_clipboard() {
+                            log::info!("Log de crash copiado al portapapeles.");
+                            self.crash_copy_flash_until =
+                                Some(Instant::now() + Duration::from_millis(700));
+                        }
                     }
-                }
-                WindowEvent::RedrawRequested => {
-                    let flashing = self
-                        .crash_copy_flash_until
-                        .map(|t| Instant::now() < t)
-                        .unwrap_or(false);
-                    match state.render_crash_screen(flashing) {
-                        Ok(_) => {}
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                        Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                        Err(e) => log::warn!("Error de render (pantalla de crash): {:?}", e),
+                    WindowEvent::RedrawRequested => {
+                        let flashing = self
+                            .crash_copy_flash_until
+                            .map(|t| Instant::now() < t)
+                            .unwrap_or(false);
+                        match state.render_crash_screen(flashing) {
+                            Ok(_) => {}
+                            Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                            Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                            Err(e) => log::warn!("Error de render (pantalla de crash): {:?}", e),
+                        }
+                        if let Some(msg) = &self.crash_short_message {
+                            window.set_title(&format!(
+                                "Voxel Engine — CRASHEADO: {} (C / tocar pantalla: copiar log)",
+                                msg
+                            ));
+                        }
                     }
-                    if let Some(msg) = &self.crash_short_message {
-                        window.set_title(&format!(
-                            "Voxel Engine — CRASHEADO: {} (C / tocar pantalla: copiar log)",
-                            msg
-                        ));
-                    }
+                    _ => {}
                 }
-                _ => {}
+            }));
+
+            if panic_result.is_err() {
+                self.double_crashed = true;
+                log::error!(
+                    "Panic DENTRO de la pantalla de crash — dejamos de intentar redibujar. \
+                     El log del primer crash ya debería estar en disco/logcat."
+                );
             }
             return;
+        }
         }
 
         // Todo lo que sigue (el juego en sí) va envuelto en

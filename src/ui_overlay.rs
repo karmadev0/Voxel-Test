@@ -129,6 +129,51 @@ fn push_ring(
 const JOYSTICK_VISUAL_RADIUS: f64 = 70.0;
 const NUB_VISUAL_RADIUS: f64 = 26.0;
 
+/// Mira central: una pequeña cruz en el medio de la pantalla, para saber
+/// hacia dónde apunta la cámara incluso cuando el bloque apuntado está
+/// fuera de alcance (`REACH`) y no hay contorno 3D dibujado todavía (ver
+/// `highlight.rs`). Se dibuja en las dos plataformas, no solo Android.
+const CROSSHAIR_LENGTH: f64 = 10.0;
+const CROSSHAIR_THICKNESS: f64 = 2.0;
+const CROSSHAIR_GAP: f64 = 4.0; // hueco en el centro, para no tapar el bloque apuntado
+
+pub fn build_crosshair(size: PhysicalSize<u32>) -> Vec<UiVertex> {
+    let mut verts = Vec::with_capacity(12);
+    let cx = size.width as f64 / 2.0;
+    let cy = size.height as f64 / 2.0;
+    let color = [1.0, 1.0, 1.0, 0.85];
+    let half_t = CROSSHAIR_THICKNESS / 2.0;
+
+    // Barra horizontal: dos segmentos (izquierda y derecha del hueco central).
+    push_quad(
+        &mut verts,
+        size,
+        (cx - CROSSHAIR_GAP - CROSSHAIR_LENGTH, cy - half_t, CROSSHAIR_LENGTH, CROSSHAIR_THICKNESS),
+        color,
+    );
+    push_quad(
+        &mut verts,
+        size,
+        (cx + CROSSHAIR_GAP, cy - half_t, CROSSHAIR_LENGTH, CROSSHAIR_THICKNESS),
+        color,
+    );
+    // Barra vertical: arriba y abajo del hueco central.
+    push_quad(
+        &mut verts,
+        size,
+        (cx - half_t, cy - CROSSHAIR_GAP - CROSSHAIR_LENGTH, CROSSHAIR_THICKNESS, CROSSHAIR_LENGTH),
+        color,
+    );
+    push_quad(
+        &mut verts,
+        size,
+        (cx - half_t, cy + CROSSHAIR_GAP, CROSSHAIR_THICKNESS, CROSSHAIR_LENGTH),
+        color,
+    );
+
+    verts
+}
+
 /// Arma toda la geometría del overlay táctil para este frame. Los
 /// controles siempre se dibujan (no solo mientras se tocan), para que el
 /// jugador vea dónde están antes de tocarlos.
