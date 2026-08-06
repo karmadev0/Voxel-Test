@@ -321,6 +321,37 @@ use std::os::unix::io::AsRawFd;
 #[cfg(target_os = "android")]
 use std::sync::atomic::{AtomicI32, Ordering};
 
+/// Guarda el `sigaction` que YA estaba instalado para cada señal antes
+/// de que nosotros pisáramos nada — que en Android, para SIGSEGV y
+/// compañía, es el handler que instala `debuggerd` (el proceso del
+/// sistema que arma los "tombstones" con backtrace nativo) apenas
+/// arranca cada proceso, mucho antes de que nuestro código corra.
+///
+/// `Option<sigaction>` (no `sigaction` directo) porque el array
+/// necesita un valor inicial antes de `install_native_signal_handlers`,
+/// y no hay un `sigaction` "vacío" seguro de inventar a mano.
+///
+/// Índices: mismo orden que el array de señales de
+/// `install_native_signal_handlers` — ver `sig_index`.
+#[cfg(target_os = "android")]
+static mut OLD_ACTIONS: [Option<libc::sigaction>; 5] = [None, None, None, None, None];
+
+/// Señales que instalamos, en el mismo orden que los índices de
+/// `OLD_ACTIONS`. Función en vez de constante para poder usarla tanto al
+/// instalar como, después, dentro del handler (`extern "C"`, sin
+/// alocar) para encontrar qué handler viejo le corresponde a cada señal.
+#[cfg(target_os = "android")]
+fn sig_index(sig: libc::c_int) -> Option<usize> {
+    match sig {
+        s if s == libc::SIGSEGV => Some(0),
+        s if s == libc::SIGABRT => Some(1),
+        s if s == libc::SIGBUS => Some(2),
+        s if s == libc::SIGILL => Some(3),
+        s if s == libc::SIGFPE => Some(4),
+        _ => None,
+    }
+}
+
 /// Descriptor crudo (no un `std::fs::File`) del archivo
 /// `native_crash.txt`, abierto por adelantado en
 /// `install_native_signal_handlers`. No se puede abrir un archivo
@@ -365,7 +396,18 @@ pub fn install_native_signal_handlers(crash_dir: Option<&std::path::Path>) {
             action.sa_sigaction = handle_fatal_signal as usize;
             action.sa_flags = libc::SA_SIGINFO;
             libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, std::ptr::null_mut());
+
+            // Clave del fix: pedimos que `sigaction` nos devuelva la
+            // acción ANTERIOR (antes pasábamos `null` acá, y la
+            // tirábamos). Para SIGSEGV/SIGBUS/etc en Android esa acción
+            // anterior es el handler de `debuggerd` — si no lo
+            // guardamos, no hay forma de reencadenar a él después.
+            let mut old_action: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(sig, &action, &mut old_action);
+
+            if let Some(idx) = sig_index(sig) {
+                OLD_ACTIONS[idx] = Some(old_action);
+            }
         }
     }
 }
@@ -430,18 +472,32 @@ extern "C" fn handle_fatal_signal(
         }
     }
 
-    // Reencadenamos: restauramos el manejador por defecto de esta señal
-    // y la volvemos a lanzar, para que el sistema (debuggerd en
-    // Android) siga su camino normal y genere el tombstone con
-    // backtrace nativo completo en logcat — bastante más útil que lo
-    // que podemos armar acá a mano. Si no hiciéramos esto, la señal
-    // quedaría "sin resolver" y el proceso podría terminar en un estado
-    // más raro que si la dejamos seguir su curso normal.
+    // Reencadenamos: FIX — antes esto reseteaba a SIG_DFL (la
+    // disposición cruda del kernel), lo que en Android SALTEABA a
+    // `debuggerd` por completo y hacía que el sistema reportara la
+    // muerte del proceso como REASON_SIGNALED (motivo genérico, sin
+    // tombstone) en vez de REASON_CRASH_NATIVE con backtrace completo.
+    // Ahora restauramos el handler que YA estaba instalado antes que el
+    // nuestro (el de `debuggerd`, guardado en `OLD_ACTIONS` al momento
+    // de instalar) y volvemos a lanzar la señal, para que el kernel la
+    // entregue a ESE handler — el camino normal que le da a
+    // `ApplicationExitInfo` el trace completo.
     unsafe {
+        if let Some(idx) = sig_index(sig) {
+            if let Some(old_action) = OLD_ACTIONS[idx] {
+                libc::sigaction(sig, &old_action, std::ptr::null_mut());
+                libc::raise(sig);
+                return;
+            }
+        }
+        // Red de seguridad: si por lo que sea no teníamos guardada la
+        // acción anterior (no debería pasar, pero mejor esto que dejar
+        // la señal "colgada"), caemos al comportamiento viejo.
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
 }
+
 
 // --- Detección de crash de la corrida ANTERIOR, al arrancar ---
 //
