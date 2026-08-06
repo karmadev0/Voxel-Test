@@ -92,7 +92,7 @@ jobs:
           # puede agregar `--target x86_64-linux-android` para probar en
           # el emulador de Android Studio (que suele correr sobre x86_64).
           RUST_LOG: info
-        run: cargo apk build --release --target aarch64-linux-android
+        run: cargo apk build --release --lib --target aarch64-linux-android
 
       - name: Ubicar el APK generado
         id: locate
