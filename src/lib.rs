@@ -842,17 +842,26 @@ fn android_main(app: AndroidApp) {
                 "No se pudo (re)crear el EventLoop ({:?}); reiniciando el proceso.",
                 e
             );
-            std::process::exit(0);
+            // OJO: nada de `std::process::exit()` acá. `android_main` corre
+            // en un pthread que generó el glue de NativeActivity, no en el
+            // hilo principal del proceso Linux. `std::process::exit()` llama
+            // a `libc::exit()`, que antes de matar el proceso corre
+            // `__cxa_finalize` (destructores globales/TLS de todo lo
+            // enlazado, incluido el runtime de Android/JNI que está atado a
+            // *este* hilo en particular). Ejecutar esa limpieza desde un
+            // hilo que no es el dueño de ese estado es lo que producía el
+            // SIGSEGV en __cxa_finalize del log. `libc::_exit()` es el
+            // syscall crudo: mata el proceso ya, sin correr un solo
+            // destructor, así que es seguro llamarlo desde cualquier hilo.
+            unsafe { libc::_exit(0) };
         }
     };
 
     run(event_loop);
 
-    // El loop terminó (el usuario cerró la app, o un error fatal de
-    // render). Forzamos la muerte del proceso en vez de dejar que Android
-    // lo mantenga vivo en caché para un relanzamiento rápido -- así el
-    // próximo lanzamiento arranca siempre desde cero.
-    std::process::exit(0);
+    // Mismo motivo que arriba: usamos _exit en vez de std::process::exit
+    // para no disparar la limpieza global desde este hilo.
+    unsafe { libc::_exit(0) };
 }
 
 /// Punto de entrada en desktop: lo llama `main.rs`. Separado de `run()`

@@ -35,6 +35,7 @@ bincode = "1.3"
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { version = "0.30", features = ["android-native-activity"] }
 android_logger = "0.13"
+libc = "0.2"
 # winit 0.30 trae android-activity 0.6.x, con más rodaje en ROMs de
 # fabricante (Honor/Huawei) que la 0.5.x vieja que traía winit 0.29.
 android-activity = "0.6"
@@ -66,6 +67,14 @@ version = 0x400000 # Vulkan 1.0
 
 [package.metadata.android.application]
 label = "Voxel Engine"
+
+# Fuerza horizontal desde que arranca la Activity (sin esto Android la abre
+# en "unspecified", que en la mayoría de los celulares es vertical).
+# "sensorLandscape" en vez de "landscape" a secas para que además permita
+# rotar entre landscape normal e invertido según cómo sostenga el celular,
+# pero nunca caiga en portrait.
+[package.metadata.android.application.activity]
+orientation = "sensorLandscape"
 
 # cargo-apk ya no genera sola una keystore de debug para builds
 # --release (sí lo hacía en versiones viejas): hay que apuntarle a una
