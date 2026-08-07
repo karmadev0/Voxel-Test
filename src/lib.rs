@@ -589,6 +589,16 @@ impl State {
         let chunk_loader = world.loader();
         let (chunk_result_tx, chunk_result_rx) = std::sync::mpsc::channel();
 
+        // Hay que leer esto ANTES del `Self { ... }` de abajo: el campo
+        // `player: session.player` mueve `session.player` a la struct
+        // (no implementa `Copy`), así que si se calculara adentro del
+        // literal, después de ese campo, sería un use-after-move — el
+        // orden de los campos de un struct literal se evalúa de arriba
+        // a abajo, pero el valor ya movido no vuelve a estar disponible
+        // más abajo en el mismo literal.
+        let current_player_chunk =
+            World::world_pos_to_chunk(session.player.feet_position.x, session.player.feet_position.z);
+
         Self {
             render,
             start_time: Instant::now(),
@@ -615,7 +625,7 @@ impl State {
             game_screen: session.game_screen,
             settings_return: session.settings_return,
             cursor_pos: (0.0, 0.0),
-            current_player_chunk: World::world_pos_to_chunk(session.player.feet_position.x, session.player.feet_position.z),
+            current_player_chunk,
             render_radius: session.render_radius,
             last_streamed_render_radius: session.render_radius,
             chunk_loader,
@@ -1835,10 +1845,6 @@ pub fn run_desktop() {
     run(event_loop, None);
 }
 
-/// Estado de la app para el nuevo modelo de `winit` 0.30+ (`ApplicationHandler`,
-/// en reemplazo del closure único que usaba `event_loop.run(...)` en 0.29).
-/// Contiene lo mismo que antes vivía como variables capturadas por el closure.
-#[derive(Default)]
 /// Snapshot en RAM de la partida en curso, armado en `suspended()` justo
 /// antes de soltar el `State` (y con él, el `wgpu::Surface` que Android
 /// ya invalidó al mandar la Activity a segundo plano). Sin esto,
@@ -1870,6 +1876,18 @@ struct SavedSession {
     autosave_interval_secs: u32,
 }
 
+/// Estado de la app para el nuevo modelo de `winit` 0.30+ (`ApplicationHandler`,
+/// en reemplazo del closure único que usaba `event_loop.run(...)` en 0.29).
+/// Contiene lo mismo que antes vivía como variables capturadas por el closure.
+///
+/// `App::default()` (ver `run()`, más abajo) arranca la app entera con
+/// `window`/`state` en `None` y las banderas de crash apagadas — la
+/// ventana y el `State` de wgpu recién se crean en el primer
+/// `resumed()` (ver el comentario grande ahí mismo). Todos los campos
+/// son `Option`/`bool`, así que el `derive` no necesita que `Window`,
+/// `State` ni `SavedSession` implementen `Default` — `Option<T>` ya es
+/// `Default` para cualquier `T` (`None`).
+#[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
     state: Option<State>,
