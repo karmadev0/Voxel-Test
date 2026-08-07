@@ -11,7 +11,28 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Carpeta raíz real a usar, si fue configurada explícitamente (ver
+/// `set_saves_root`). En Android, `PathBuf::from("saves")` (el default de
+/// abajo) es una ruta relativa que resuelve contra el directorio de
+/// trabajo del proceso — que ahí es "/", de solo lectura. Por eso hace
+/// falta poder pisarlo con una carpeta privada de verdad de la app
+/// (`internal_data_path()` / `external_data_path()`), la misma idea que
+/// ya usa `crash_dir` en `platform/crash.rs`.
+static SAVES_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Configura la carpeta raíz de guardado. Llamar una sola vez, lo antes
+/// posible en `android_main` (antes de tocar cualquier mundo), con una
+/// carpeta escribible de verdad. En desktop no hace falta llamarlo: el
+/// default relativo ("saves", al lado del ejecutable) ya funciona.
+/// Si se llama más de una vez, las llamadas siguientes no tienen efecto
+/// (no debería pasar en la práctica, pero mejor no entrar en pánico por
+/// eso).
+pub fn set_saves_root(dir: PathBuf) {
+    let _ = SAVES_ROOT.set(dir);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldMeta {
@@ -24,7 +45,10 @@ pub struct WorldMeta {
 
 /// Carpeta raíz donde viven todas las carpetas de mundos, una por mundo.
 fn saves_root() -> PathBuf {
-    PathBuf::from("saves")
+    SAVES_ROOT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("saves"))
 }
 
 /// Convierte el nombre elegido por el jugador en un nombre de carpeta

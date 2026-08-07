@@ -879,6 +879,30 @@ pub fn build_pause_screen(size: PhysicalSize<u32>) -> Vec<UiVertex> {
     v
 }
 
+/// Pantalla de "GUARDANDO...", intercalada entre Playing/Pause y
+/// MainMenu al tocar "SALIR" (ver `GameScreen::Saving` en lib.rs). A
+/// diferencia de las otras pantallas de menú, no tiene botones ni
+/// "< VOLVER" ni la nota "JUEGO PAUSADO" — no es interactiva, solo
+/// feedback de que el guardado (síncrono, puede tardar) está en curso.
+pub fn build_saving_screen(size: PhysicalSize<u32>) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(64);
+    let panel = push_menu_panel_background(&mut v, size);
+    let (_panel_x, panel_y, _panel_w, panel_h) = panel;
+    push_menu_title(&mut v, size, panel, "GUARDANDO...");
+
+    let cx = size.width as f64 * 0.5;
+    let note_y = panel_y + panel_h * 0.5;
+    push_text_centered(
+        &mut v,
+        size,
+        "No cierres la app",
+        cx,
+        note_y,
+        [0.6, 0.65, 0.75, 0.85],
+    );
+    v
+}
+
 /// Pantalla de selector de modo de juego (Pause -> GameMode).
 pub fn build_gamemode_screen(size: PhysicalSize<u32>, game_mode_index: usize) -> Vec<UiVertex> {
     let mut v = Vec::with_capacity(256);

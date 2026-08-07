@@ -97,6 +97,14 @@ enum GameScreen {
     /// Ajustes menos frecuentes (info de build, panel de debug),
     /// fullscreen, abierto desde Settings vía "AJUSTES ADICIONALES".
     SettingsMore,
+    /// Pantalla no interactiva de "GUARDANDO...", intercalada entre
+    /// `Playing`/`Pause` y `MainMenu` al tocar "SALIR" (ver
+    /// `TouchAction::ExitGame`). Dura exactamente 2 frames: el primero
+    /// solo pinta esta pantalla (ver `State::saving_started`), el
+    /// segundo hace el guardado real — así el guardado, que es
+    /// síncrono y puede tardar con mundos grandes, no bloquea el frame
+    /// sin que el jugador vea ningún feedback antes.
+    Saving,
 }
 
 /// Modo de juego, igual que en Minecraft:
@@ -395,6 +403,16 @@ struct State {
     /// `autosave_interval_secs` en cada `update()` mientras se está
     /// jugando.
     last_autosave: Instant,
+
+    /// Distingue el primer frame en `GameScreen::Saving` (todavía en
+    /// `false`: `update()` no hace nada más que dejar pasar el frame
+    /// para que `render()` pinte "GUARDANDO...") del segundo frame en
+    /// adelante (ya en `true`: recién ahí `update()` ejecuta el
+    /// guardado síncrono de verdad y vuelve a `MainMenu`). Sin este
+    /// diferimiento de un frame, el guardado se ejecutaría en el mismo
+    /// frame en que se entra a `Saving` y la pantalla nunca llegaría a
+    /// pintarse antes del bloqueo.
+    saving_started: bool,
 }
 
 impl State {
@@ -456,6 +474,7 @@ impl State {
             pending_delete_index: None,
             autosave_interval_secs: DEFAULT_AUTOSAVE_SECS,
             last_autosave: Instant::now(),
+            saving_started: false,
         }
     }
 
@@ -514,6 +533,20 @@ impl State {
         self.last_frame = Instant::now();
     }
 
+    /// Contraparte de `start_world`: descarga el mundo actual de memoria
+    /// (mallas de GPU, chunks pendientes de generar/mallear, nombre del
+    /// mundo activo) al volver al menú principal desde `ExitGame`. No
+    /// toca disco — el guardado ya lo hizo el caller (`save_dirty_chunks`)
+    /// antes de llamar a esto. Sin esto, `chunk_meshes` seguía apuntando
+    /// al mundo abandonado y el loop de render lo dibujaba de fondo hasta
+    /// la próxima vez que se cargara un mundo.
+    fn unload_world(&mut self) {
+        self.chunk_meshes.clear();
+        self.pending_chunks.clear();
+        while self.chunk_result_rx.try_recv().is_ok() {}
+        self.current_world_name = None;
+    }
+
     /// Arma un `SavedSession` con todo lo necesario para restaurar la
     /// partida actual en otra superficie/dispositivo wgpu (ver comentario
     /// de `SavedSession`). Solo tiene sentido llamarla con un mundo
@@ -536,7 +569,12 @@ impl State {
             // `Playing` (sin pasar por pausa) sería una sorpresa
             // desagradable después de haber estado en otra app, así que
             // ahí sí forzamos `Pause`.
-            game_screen: if self.game_screen == GameScreen::Playing {
+            game_screen: if self.game_screen == GameScreen::Playing || self.game_screen == GameScreen::Saving {
+                // `Saving` es transitorio (2 frames) y no interactivo —
+                // restaurarlo tal cual dejaría la app trabada en una
+                // pantalla sin salida si Android suspende justo en ese
+                // instante minúsculo. `Pause` es la reanudación segura,
+                // igual que para `Playing`.
                 GameScreen::Pause
             } else {
                 self.game_screen
@@ -639,6 +677,7 @@ impl State {
             pending_delete_index: None,
             autosave_interval_secs: session.autosave_interval_secs,
             last_autosave: Instant::now(),
+            saving_started: false,
         }
     }
 
@@ -877,12 +916,16 @@ impl State {
             TouchAction::ExitGame => {
                 // "SALIR" del menú de pausa: NO cierra la app, guarda el
                 // mundo y vuelve al menú principal (ver `ExitApp` para
-                // cerrar la app de verdad, desde MainMenu).
-                let saved = self.world.save_dirty_chunks();
-                if saved > 0 {
-                    log::info!("Guardados {} chunks modificados al volver al menú principal.", saved);
-                }
-                self.game_screen = GameScreen::MainMenu;
+                // cerrar la app de verdad, desde MainMenu). El guardado
+                // en sí NO pasa acá: es síncrono y puede tardar (mundo
+                // grande, muchos chunks sucios), así que lo diferimos al
+                // frame siguiente para que antes se llegue a pintar la
+                // pantalla "GUARDANDO..." (ver `update()` y
+                // `saving_started`) — si guardáramos ahora mismo, el
+                // frame se bloquearía sin que el jugador vea ningún
+                // feedback antes.
+                self.saving_started = false;
+                self.game_screen = GameScreen::Saving;
             }
             TouchAction::ExitApp => {
                 event_loop.exit();
@@ -905,7 +948,11 @@ impl State {
                     GameScreen::Pause => GameScreen::Playing,
                     GameScreen::WorldList => GameScreen::MainMenu,
                     GameScreen::NameWorld | GameScreen::ConfirmDeleteWorld => GameScreen::WorldList,
-                    GameScreen::MainMenu | GameScreen::Playing => self.game_screen,
+                    // `Saving` no tiene botón "< VOLVER" (no es
+                    // interactiva), pero cubrimos el brazo para que el
+                    // match siga siendo exhaustivo — no debería
+                    // dispararse nunca en la práctica.
+                    GameScreen::MainMenu | GameScreen::Playing | GameScreen::Saving => self.game_screen,
                 };
                 if self.game_screen == GameScreen::Playing {
                     // Reiniciamos last_frame para no acumular
@@ -1336,6 +1383,31 @@ impl State {
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
 
+        // Pantalla de "GUARDANDO...": primer frame, solo dejamos pasar
+        // (así `render()` de este mismo ciclo llega a pintar la
+        // pantalla antes del guardado, que bloquea). Segundo frame en
+        // adelante: recién ahí guardamos de verdad y volvemos al menú
+        // principal.
+        if self.game_screen == GameScreen::Saving {
+            if !self.saving_started {
+                self.saving_started = true;
+                return;
+            }
+            let saved = self.world.save_dirty_chunks();
+            if saved > 0 {
+                log::info!("Guardados {} chunks modificados al volver al menú principal.", saved);
+            }
+            // FIX: sin esto, `chunk_meshes` seguía teniendo las mallas
+            // del mundo que se acaba de abandonar, y el loop de render
+            // las dibuja sin mirar `game_screen` — por eso se veía el
+            // mundo anterior de fondo, un instante, al volver al menú
+            // principal (y hasta la próxima vez que se entrara a un
+            // mundo, ya que `start_world` recién ahí las reemplaza).
+            self.unload_world();
+            self.game_screen = GameScreen::MainMenu;
+            return;
+        }
+
         // En cualquier pantalla de menú (pausa, modo de juego, ajustes,
         // ajustes adicionales): el juego queda pausado. Solo
         // actualizamos el tiempo para no acumular un dt enorme al
@@ -1525,6 +1597,7 @@ impl State {
                 self.show_debug_panel,
                 self.autosave_interval_secs,
             ),
+            GameScreen::Saving => ui_overlay::build_saving_screen(self.render.size),
             GameScreen::Playing => {
                 let mut verts = ui_overlay::build_crosshair(self.render.size);
                 #[cfg(target_os = "android")]
@@ -1752,6 +1825,22 @@ fn android_main(app: AndroidApp) {
     // `crash::install` igual siguen funcionando, solo que sin poder
     // escribir sus archivos (todo queda en logcat).
     let crash_dir = app.external_data_path().or_else(|| app.internal_data_path());
+
+    // Igual que `crash_dir`: `save_manager::saves_root()` por defecto es
+    // una ruta relativa ("saves"), que en Android resuelve contra "/"
+    // (solo lectura) en vez de una carpeta propia de la app. La pisamos
+    // acá con la misma carpeta privada que ya usamos para crash logs,
+    // ANTES de que cualquier código toque un mundo (list_worlds,
+    // create_world, start_world, etc.) — si no, la carpeta "saves"
+    // relativa ya podría haber fallado en crearse.
+    if let Some(dir) = crash_dir.clone() {
+        environment::save_manager::set_saves_root(dir.join("saves"));
+    } else {
+        log::warn!(
+            "No hay carpeta de datos escribible (external/internal_data_path); \
+             los mundos no van a poder guardarse en este dispositivo."
+        );
+    }
 
     // Instala el logger (reemplaza a `android_logger::init_once`: sigue
     // mandando todo a logcat exactamente igual que antes, y además
@@ -2190,7 +2279,11 @@ impl ApplicationHandler for App {
                                 GameScreen::ConfirmDeleteWorld => {
                                     state.touch.on_click_confirmdelete(pos, size)
                                 }
-                                GameScreen::Playing => None,
+                                // No interactiva: mientras se guarda, un
+                                // click no debe disparar ninguna acción
+                                // (no hay botones dibujados en esta
+                                // pantalla, ver `build_saving_screen`).
+                                GameScreen::Saving | GameScreen::Playing => None,
                             };
                             if let Some(action) = action {
                                 state.apply_menu_action(action, event_loop, window);
@@ -2244,6 +2337,10 @@ impl ApplicationHandler for App {
                         GameScreen::ConfirmDeleteWorld => {
                             state.touch.on_touch_confirmdelete(touch, state.render.size)
                         }
+                        // No interactiva: mientras se guarda, ignoramos
+                        // cualquier toque (misma razón que en el match
+                        // de click, arriba).
+                        GameScreen::Saving => None,
                         GameScreen::Playing => {
                             // En juego: procesamos controles táctiles normales.
                             // Si el panel de debug está prendido, le pasamos
@@ -2356,6 +2453,13 @@ impl ApplicationHandler for App {
                                 // "Playing" (todavía no hay partida
                                 // corriendo).
                                 state.game_screen = GameScreen::MainMenu;
+                            } else if state.game_screen == GameScreen::Saving {
+                                // Mientras se guarda: Esc no hace nada.
+                                // En particular, NO debe reanudar el
+                                // juego a mitad de un guardado (la rama
+                                // general de abajo fuerza `Playing`,
+                                // que acá sería incorrecto porque
+                                // `unload_world()` todavía no corrió).
                             } else {
                                 // Desde cualquier pantalla de menú
                                 // colgando de Pause, Esc cierra todo de
