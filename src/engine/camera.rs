@@ -8,6 +8,11 @@ use glam::{Mat4, Vec3};
 use winit::event::ElementState;
 use winit::keyboard::KeyCode;
 
+/// Se deriva `Clone` para poder tomar una copia de la cámara al armar
+/// `SavedSession` (ver lib.rs) cuando Android destruye la superficie en
+/// segundo plano — así `resumed()` la restaura tal cual estaba, sin
+/// resetear posición/rotación.
+#[derive(Clone)]
 pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,   // rotación horizontal, en radianes

@@ -4,6 +4,7 @@
 pub mod chunk;
 pub mod clouds;
 pub mod mesher;
+pub mod save_manager;
 pub mod sky;
 pub mod world;
 pub mod worldgen;

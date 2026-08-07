@@ -157,8 +157,14 @@ fn push_toggle_switch(
 // Bit 0 del u32 = columna 0, fila 0 (arriba-izquierda).
 // Codificado por filas de arriba a abajo, bits de izquierda a derecha.
 
+/// Glifos en minúscula (rows 0-1 en blanco salvo ascendentes/puntos):
+/// como la celda tiene 7 filas y no hay lugar para un verdadero
+/// descendente por debajo del renglón, las letras con descendente
+/// (g, j, p, q, y) lo insinúan doblando el trazo en la fila 6 en vez de
+/// bajar más — es un truco de fuente bitmap chica, no un error.
 fn char_bitmap(c: char) -> [u8; 7] {
-    match c.to_ascii_uppercase() {
+    match c {
+        // --- Mayúsculas A-Z ---
         'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
         'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
         'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
@@ -203,6 +209,56 @@ fn char_bitmap(c: char) -> [u8; 7] {
         '/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         '<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
         '>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
+
+        // --- Minúsculas a-z: altura-x en filas 2-6, ascendentes
+        // (b,d,f,h,k,l,t) usan también las filas 0-1. ---
+        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'b' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110],
+        'c' => [0b00000, 0b00000, 0b01111, 0b10000, 0b10000, 0b10000, 0b01111],
+        'd' => [0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111],
+        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01111],
+        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
+        'g' => [0b00000, 0b00000, 0b01111, 0b10001, 0b01111, 0b00001, 0b01110],
+        'h' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
+        'i' => [0b00100, 0b00000, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'j' => [0b00010, 0b00000, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
+        'k' => [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010],
+        'l' => [0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b00111],
+        'm' => [0b00000, 0b00000, 0b11011, 0b10101, 0b10101, 0b10101, 0b10101],
+        'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
+        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b11110, 0b10000],
+        'q' => [0b00000, 0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001],
+        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
+        's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+        't' => [0b01000, 0b11111, 0b01000, 0b01000, 0b01000, 0b01001, 0b00110],
+        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        'v' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
+        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
+        'y' => [0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        'z' => [0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111],
+
+        // --- Acentos y ñ/ü. Solo hay una fila libre arriba de la letra
+        // para el signo diacrítico: en minúsculas ya sobraba (fila 1);
+        // en mayúsculas se "roba" la fila 0 del glifo original (que
+        // para A/E/I/O/U repite el trazo de la fila 1, así que no se
+        // pierde forma reconocible). ---
+        'á' => [0b00000, 0b00010, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'é' => [0b00000, 0b00010, 0b01110, 0b10001, 0b11111, 0b10000, 0b01111],
+        'í' => [0b00010, 0b00000, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'ó' => [0b00000, 0b00010, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
+        'ú' => [0b00000, 0b00010, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        'ü' => [0b00000, 0b01010, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        'ñ' => [0b01010, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'Á' => [0b00010, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'É' => [0b00010, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'Í' => [0b00010, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
+        'Ó' => [0b00010, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'Ú' => [0b00010, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'Ü' => [0b01010, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'Ñ' => [0b01010, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+
         _ =>   [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111], // caja para desconocidos
     }
 }
@@ -762,6 +818,36 @@ fn push_toggle_row(
     push_quad(v, size, (row.0, row.1 + row.3 + 4.0, row.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 }
 
+/// Menú principal: primera pantalla que ve el jugador al abrir la app
+/// (ver `GameScreen::MainMenu` en lib.rs). Título placeholder
+/// "VOXEL-ENGINE" + 3 botones ("JUGAR" / "CONFIGURACIÓN" / "SALIR"). A
+/// diferencia de las otras 4 pantallas de menú, no tiene botón
+/// "< VOLVER" (es la raíz de todo) ni la nota "JUEGO PAUSADO" (todavía
+/// no hay una partida en curso para pausar).
+pub fn build_main_menu_screen(size: PhysicalSize<u32>) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(256);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "VOXEL-ENGINE");
+
+    const LABELS: [&str; 3] = ["JUGAR", "CONFIGURACION", "SALIR"];
+    const COLORS: [[f32; 4]; 3] = [
+        [0.16, 0.32, 0.18, 0.9],
+        [0.15, 0.2, 0.32, 0.9],
+        [0.32, 0.14, 0.16, 0.9],
+    ];
+    const TEXT_COLORS: [[f32; 4]; 3] = [
+        [0.78, 1.0, 0.82, 1.0],
+        [0.85, 0.9, 1.0, 1.0],
+        [1.0, 0.75, 0.72, 1.0],
+    ];
+    for i in 0..3 {
+        let rect = TouchController::rect_main_menu_button(size, i);
+        push_big_button(&mut v, size, rect, LABELS[i], COLORS[i], TEXT_COLORS[i]);
+    }
+
+    v
+}
+
 /// Pantalla de pausa (Playing -> Pause): el menú raíz al que se llega
 /// desde el botón de engranaje / tecla Esc. 3 botones grandes: "MODO DE
 /// JUEGO", "AJUSTES" y "SALIR". Ya no muestra ningún control en sí —
@@ -883,12 +969,128 @@ pub fn build_settings_screen(
     v
 }
 
+/// Lista de mundos guardados (MainMenu -> WorldList), alcanzable desde
+/// "JUGAR". "+ CREAR MUNDO NUEVO" arriba de todo, después una fila por
+/// cada mundo guardado (más reciente primero, ver
+/// `save_manager::list_worlds`). Sin nota "JUEGO PAUSADO": todavía no
+/// hay ninguna partida corriendo acá, igual que en `MainMenu`.
+pub fn build_worldlist_screen(size: PhysicalSize<u32>, world_names: &[String]) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(512);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "MUNDOS");
+
+    let create_rect = TouchController::rect_worldlist_create_button(size);
+    push_big_button(&mut v, size, create_rect, "+ CREAR MUNDO NUEVO", [0.16, 0.32, 0.18, 0.9], [0.78, 1.0, 0.82, 1.0]);
+
+    if world_names.is_empty() {
+        let cx = size.width as f64 * 0.5;
+        let empty_y = create_rect.1 + create_rect.3 + 40.0;
+        push_text_centered(&mut v, size, "TODAVIA NO HAY MUNDOS GUARDADOS", cx, empty_y, [0.6, 0.63, 0.7, 1.0]);
+    } else {
+        for (i, name) in world_names.iter().enumerate().take(TouchController::WORLDLIST_MAX_ROWS) {
+            let row = TouchController::rect_worldlist_row(size, i);
+            push_quad(&mut v, size, row, [0.14, 0.16, 0.22, 0.9]);
+            let lx = row.0 + 18.0;
+            let ly = row.1 + (row.3 - FONT_CELL_H) * 0.5;
+            push_text(&mut v, size, name, lx, ly, [0.85, 0.9, 1.0, 1.0]);
+
+            // Ícono de borrar ("X"), separado de la fila para que no se
+            // pueda tocar por error al elegir el mundo (ver
+            // `TouchController::rect_worldlist_delete_button`).
+            let del = TouchController::rect_worldlist_delete_button(size, i);
+            push_quad(&mut v, size, del, [0.30, 0.12, 0.14, 0.9]);
+            let x_label = "X";
+            let xlx = del.0 + (del.2 - text_width(x_label)) * 0.5;
+            let xly = del.1 + (del.3 - FONT_CELL_H) * 0.5;
+            push_text(&mut v, size, x_label, xlx, xly, [1.0, 0.6, 0.6, 1.0]);
+        }
+    }
+
+    push_back_button(&mut v, size);
+    v
+}
+
+/// Pantalla para escribir el nombre de un mundo nuevo (WorldList ->
+/// NameWorld, ver `TouchAction::OpenNameWorld`). El texto lo escribe el
+/// IME nativo del sistema (teclado de Android/PC de toda la vida, ver
+/// `set_ime_allowed`/`WindowEvent::Ime` en lib.rs) — acá solo se dibuja
+/// el cuadro con lo ya escrito, "BORRAR" y el botón grande "CREAR
+/// MUNDO" que confirma. "< VOLVER" (arriba a la izquierda, como en toda
+/// pantalla de menú) cancela sin crear nada.
+pub fn build_nameworld_screen(size: PhysicalSize<u32>, name_input: &str, name_preedit: &str) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(512);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "NOMBRE DEL MUNDO");
+
+    // Cuadro de texto con el nombre ya confirmado + lo que el IME esté
+    // componiendo en este momento (`name_preedit`, en un color más
+    // apagado y con una línea debajo — el mismo lenguaje visual que usa
+    // cualquier IME de escritorio para distinguir "todavía escribiendo"
+    // de "ya confirmado") + cursor fijo al final.
+    let field = TouchController::rect_nameworld_textfield(size);
+    push_quad(&mut v, size, (field.0 - 2.0, field.1 - 2.0, field.2 + 4.0, field.3 + 4.0), [0.4, 0.55, 0.9, 0.35]);
+    push_quad(&mut v, size, field, [0.08, 0.09, 0.14, 0.95]);
+    let tx = field.0 + 14.0;
+    let ty = field.1 + (field.3 - FONT_CELL_H) * 0.5;
+    push_text(&mut v, size, name_input, tx, ty, [0.9, 0.95, 1.0, 1.0]);
+    let mut cur_x = tx + text_width(name_input);
+    if !name_preedit.is_empty() {
+        if !name_input.is_empty() {
+            cur_x += FONT_CHAR_GAP;
+        }
+        push_text(&mut v, size, name_preedit, cur_x, ty, [0.7, 0.78, 0.95, 0.85]);
+        // Línea de subrayado bajo el texto en composición, para que se
+        // note de un vistazo que todavía no está "confirmado" aunque ya
+        // se vea escrito.
+        let underline_y = ty + FONT_CELL_H + 2.0;
+        push_quad(&mut v, size, (cur_x, underline_y, text_width(name_preedit), 2.0), [0.5, 0.6, 0.85, 0.7]);
+        cur_x += text_width(name_preedit) + FONT_CHAR_GAP;
+    }
+    push_text(&mut v, size, "_", cur_x, ty, [0.9, 0.95, 1.0, 1.0]);
+
+    // "BORRAR".
+    let back_key = TouchController::rect_nameworld_backspace(size);
+    push_big_button(&mut v, size, back_key, "BORRAR", [0.30, 0.12, 0.14, 0.9], [1.0, 0.75, 0.75, 1.0]);
+
+    // Confirmar.
+    let confirm = TouchController::rect_nameworld_confirm(size);
+    push_big_button(&mut v, size, confirm, "CREAR MUNDO", [0.16, 0.32, 0.18, 0.9], [0.78, 1.0, 0.82, 1.0]);
+
+    push_back_button(&mut v, size);
+    v
+}
+
+/// Confirmación antes de borrar un mundo (WorldList -> ConfirmDeleteWorld,
+/// ver `TouchAction::RequestDeleteWorld`). "< VOLVER" y "CANCELAR" hacen
+/// lo mismo (`TouchAction::Back`, vuelve a la lista sin tocar nada);
+/// solo "BORRAR" dispara `TouchAction::ConfirmDeleteWorld`.
+pub fn build_confirm_delete_screen(size: PhysicalSize<u32>, world_name: &str) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(256);
+    let panel = push_menu_panel_background(&mut v, size);
+    let sep_y = push_menu_title(&mut v, size, panel, "BORRAR MUNDO");
+
+    let cx = size.width as f64 * 0.5;
+    push_text_centered(&mut v, size, "SE VA A BORRAR PARA SIEMPRE:", cx, sep_y + 30.0, [0.8, 0.85, 0.95, 1.0]);
+    push_text_large_centered(&mut v, size, world_name, cx, sep_y + 66.0, [1.0, 0.8, 0.8, 1.0]);
+    push_text_centered(&mut v, size, "ESTA ACCION NO SE PUEDE DESHACER", cx, sep_y + 112.0, [0.6, 0.63, 0.7, 1.0]);
+
+    let cancel = TouchController::rect_confirmdelete_cancel_button(size);
+    push_big_button(&mut v, size, cancel, "CANCELAR", [0.14, 0.16, 0.22, 0.9], [0.85, 0.9, 1.0, 1.0]);
+    let confirm = TouchController::rect_confirmdelete_confirm_button(size);
+    push_big_button(&mut v, size, confirm, "BORRAR", [0.36, 0.12, 0.14, 0.95], [1.0, 0.7, 0.7, 1.0]);
+
+    push_back_button(&mut v, size);
+    v
+}
+
 /// Pantalla de ajustes adicionales (Settings -> SettingsMore): controles
-/// que se tocan con menos frecuencia — info de build y panel de debug.
+/// que se tocan con menos frecuencia — info de build, panel de debug e
+/// intervalo de autoguardado.
 pub fn build_settings_more_screen(
     size: PhysicalSize<u32>,
     show_build_info: bool,
     show_debug_panel: bool,
+    autosave_interval_secs: u32,
 ) -> Vec<UiVertex> {
     let mut v = Vec::with_capacity(512);
     let panel = push_menu_panel_background(&mut v, size);
@@ -899,6 +1101,23 @@ pub fn build_settings_more_screen(
 
     let row2 = TouchController::rect_settings_debug_panel_row(size);
     push_toggle_row(&mut v, size, row2, "PANEL DE DEBUG (F3)", show_debug_panel);
+
+    // --- "AUTOGUARDADO" (cíclico [-]/[+] implícito: un tap avanza al
+    // siguiente valor de `AUTOSAVE_OPTIONS_SECS`, ver
+    // `TouchAction::CycleAutosaveInterval`) ---
+    let row3 = TouchController::rect_settings_autosave_row(size);
+    let label3_y = row3.1 + (row3.3 - FONT_CELL_H) * 0.5;
+    push_text(&mut v, size, "AUTOGUARDADO", row3.0, label3_y, [0.85, 0.88, 0.95, 1.0]);
+    let value_text = if autosave_interval_secs >= 60 {
+        format!("{} MIN", autosave_interval_secs / 60)
+    } else {
+        format!("{} S", autosave_interval_secs)
+    };
+    push_quad(&mut v, size, TouchController::rect_row_switch(row3), [0.18, 0.22, 0.32, 0.9]);
+    let switch = TouchController::rect_row_switch(row3);
+    let value_lx = switch.0 + (switch.2 - text_width(&value_text)) * 0.5;
+    push_text(&mut v, size, &value_text, value_lx, label3_y, [1.0, 0.85, 0.4, 1.0]);
+    push_quad(&mut v, size, (row3.0, row3.1 + row3.3 + 4.0, row3.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 
     push_back_button(&mut v, size);
     push_pause_note(&mut v, size, panel);

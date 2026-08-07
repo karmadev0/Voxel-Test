@@ -89,6 +89,45 @@ pub enum TouchAction {
     SelectBlock(u8), // 1..=5
     /// El jugador tocó el botón de engranaje → ir al menú de pausa.
     OpenPause,
+    /// "JUGAR" en el menú principal → abrir la lista de mundos
+    /// (`GameScreen::WorldList`), no entrar directo a una partida.
+    PlayGame,
+    /// Tocó uno de los mundos de la lista (`GameScreen::WorldList`) →
+    /// cargarlo y entrar a jugar. El índice es la posición en
+    /// `State::available_worlds`.
+    SelectWorld(usize),
+    /// "+ CREAR MUNDO NUEVO" en la lista de mundos → abre el teclado en
+    /// pantalla (`GameScreen::NameWorld`) para elegir nombre, en vez de
+    /// crear el mundo directamente (ver `TouchAction::ConfirmNameWorld`).
+    OpenNameWorld,
+    /// Llegó un carácter para el nombre que se está escribiendo en
+    /// `GameScreen::NameWorld`. Ya no lo dispara un teclado dibujado a
+    /// mano: lo dispara el IME nativo del sistema vía
+    /// `WindowEvent::Ime(Ime::Commit(text))` (ver `window_event` en
+    /// lib.rs), que manda ese texto un `char` a la vez con esta misma
+    /// acción. Se agrega al nombre si no se llegó todavía a
+    /// `NAME_INPUT_MAX_CHARS`.
+    KeyboardChar(char),
+    /// Tocó el botón "BORRAR" (o la tecla física Backspace) → saca el
+    /// último carácter del nombre que se está escribiendo.
+    KeyboardBackspace,
+    /// Tocó "CREAR MUNDO" en `GameScreen::NameWorld` → crea el mundo con
+    /// el nombre escrito (o uno autogenerado si quedó vacío) y entra a
+    /// jugar directamente, igual que antes hacía `CreateNewWorld`.
+    ConfirmNameWorld,
+    /// Tocó el ícono de borrar de una fila en la lista de mundos → abre
+    /// `GameScreen::ConfirmDeleteWorld` para confirmar antes de borrar
+    /// de verdad (el índice es la posición en `State::available_worlds`,
+    /// igual que en `SelectWorld`).
+    RequestDeleteWorld(usize),
+    /// Tocó "BORRAR" en la pantalla de confirmación → borra de disco el
+    /// mundo apuntado por `State::pending_delete_index` y vuelve a la
+    /// lista ya refrescada. Cancelar esa pantalla reutiliza `Back`, no
+    /// hace falta una acción aparte.
+    ConfirmDeleteWorld,
+    /// "SALIR" en el menú principal → cierra la aplicación entera (a
+    /// diferencia de `ExitGame`, que solo vuelve al menú principal).
+    ExitApp,
     /// El jugador tocó "MODO DE JUEGO" en el menú de pausa → ir al
     /// selector de modo de juego.
     OpenGameModeScreen,
@@ -98,7 +137,9 @@ pub enum TouchAction {
     /// El jugador tocó "AJUSTES ADICIONALES" en la pantalla de ajustes
     /// → ir a la pantalla de ajustes adicionales.
     OpenSettingsMore,
-    /// El jugador tocó "SALIR" en el menú de pausa → cierra el juego.
+    /// El jugador tocó "SALIR" en el menú de pausa → guarda el mundo y
+    /// vuelve al menú principal (NO cierra la aplicación, ver `ExitApp`
+    /// para eso).
     ExitGame,
     /// El jugador tocó "< VOLVER" en cualquier pantalla de menú → sube
     /// un nivel en la jerarquía (ver el comentario de `GameScreen` en
@@ -138,6 +179,10 @@ pub enum TouchAction {
     /// desktop (ver lib.rs), de ahí el nombre entre paréntesis en la
     /// etiqueta de la fila.
     ToggleDebugPanel,
+    /// Avanza el intervalo de autoguardado un paso dentro de
+    /// `AUTOSAVE_OPTIONS_SECS` (cíclico: después del último vuelve al
+    /// primero). Fila "AUTOGUARDADO" en ajustes adicionales.
+    CycleAutosaveInterval,
     /// El jugador tocó el botón "COPIAR" dentro del panel de debug (solo
     /// llega desde `on_touch_game`, no desde `on_touch_settings`: el
     /// panel de debug se dibuja encima del juego, no de la pantalla de
@@ -224,6 +269,190 @@ impl TouchController {
     /// Botón "Volver" en la pantalla de configuración: esquina superior izquierda.
     pub(crate) fn rect_back_button(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
         (MARGIN, MARGIN, 160.0, 56.0)
+    }
+
+    // --- Menú principal (MainMenu): 3 botones grandes apilados, debajo
+    // del título "VOXEL-ENGINE" (ver `ui_overlay::build_main_menu_screen`) ---
+
+    /// Uno de los 3 botones del menú principal: 0 = "JUGAR",
+    /// 1 = "CONFIGURACIÓN", 2 = "SALIR" (mismo orden en
+    /// `build_main_menu_screen` y en `hit_main_menu`).
+    pub(crate) fn rect_main_menu_button(size: PhysicalSize<u32>, index: usize) -> (f64, f64, f64, f64) {
+        let cx = size.width as f64 * 0.5;
+        let btn_w = 420.0_f64.min(size.width as f64 * 0.8);
+        let btn_h = 68.0;
+        let gap = 22.0;
+        let total_h = btn_h * 3.0 + gap * 2.0;
+        // Un poco más abajo que el centro vertical, para dejarle lugar
+        // arriba al título grande "VOXEL-ENGINE".
+        let start_y = size.height as f64 * 0.58 - total_h * 0.5;
+        let y = start_y + index as f64 * (btn_h + gap);
+        (cx - btn_w * 0.5, y, btn_w, btn_h)
+    }
+
+    // --- Lista de mundos (MainMenu -> WorldList) ---
+
+    /// Cuántas filas de mundo entran en pantalla como máximo (si hay más
+    /// mundos guardados que esto, por ahora los de más abajo no son
+    /// clickeables — alcanza para esta parte, un scroll queda pendiente).
+    pub const WORLDLIST_MAX_ROWS: usize = 6;
+
+    /// Ancho reservado a la derecha de cada fila para el botón de
+    /// borrar (ver `rect_worldlist_delete_button`), separado del resto
+    /// de la fila por `gap` px para que no se puedan tocar por error.
+    const WORLDLIST_DELETE_BTN_SIZE: f64 = 44.0;
+    const WORLDLIST_DELETE_BTN_GAP: f64 = 10.0;
+
+    /// Botón "+ CREAR MUNDO NUEVO", arriba de la lista.
+    pub(crate) fn rect_worldlist_create_button(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let cx = size.width as f64 * 0.5;
+        let btn_w = 460.0_f64.min(size.width as f64 * 0.82);
+        let btn_h = 64.0;
+        let y = size.height as f64 * 0.28;
+        (cx - btn_w * 0.5, y, btn_w, btn_h)
+    }
+
+    /// Fila de un mundo guardado en la lista, por índice (0 = el más
+    /// reciente, arriba de todo). Más angosta que el ancho total del
+    /// panel para dejarle lugar al botón de borrar
+    /// (`rect_worldlist_delete_button`) a la derecha, sin que se
+    /// superpongan.
+    pub(crate) fn rect_worldlist_row(size: PhysicalSize<u32>, index: usize) -> (f64, f64, f64, f64) {
+        let create = Self::rect_worldlist_create_button(size);
+        let row_h = 60.0;
+        let gap = 12.0;
+        let y = create.1 + create.3 + 22.0 + index as f64 * (row_h + gap);
+        let reserved = Self::WORLDLIST_DELETE_BTN_SIZE + Self::WORLDLIST_DELETE_BTN_GAP;
+        (create.0, y, create.2 - reserved, row_h)
+    }
+
+    /// Botón (ícono "X") para borrar un mundo de la lista, a la derecha
+    /// de su fila. Dispara `TouchAction::RequestDeleteWorld`, que abre
+    /// `GameScreen::ConfirmDeleteWorld` en vez de borrar directo.
+    pub(crate) fn rect_worldlist_delete_button(size: PhysicalSize<u32>, index: usize) -> (f64, f64, f64, f64) {
+        let row = Self::rect_worldlist_row(size, index);
+        let x = row.0 + row.2 + Self::WORLDLIST_DELETE_BTN_GAP;
+        let y = row.1 + (row.3 - Self::WORLDLIST_DELETE_BTN_SIZE) * 0.5;
+        (x, y, Self::WORLDLIST_DELETE_BTN_SIZE, Self::WORLDLIST_DELETE_BTN_SIZE)
+    }
+
+    // --- Campo de nombre de mundo (WorldList -> NameWorld) ---
+    // El texto en sí ya no lo escribe una grilla dibujada a mano: lo
+    // escribe el IME nativo del sistema (`Window::set_ime_allowed` +
+    // `WindowEvent::Ime`, ver `window_event` en lib.rs). Acá solo queda
+    // el hit-test del cuadro de texto (por si algún día hace falta
+    // reposicionar el cursor tocándolo) y de los dos botones de acción,
+    // "BORRAR" y "CREAR MUNDO".
+
+    /// Tope de caracteres del nombre escrito — alcanza de sobra para
+    /// que entre en la fila de la lista y en la carpeta de guardado, y
+    /// deja margen dentro del cuadro de texto en pantalla.
+    pub const NAME_INPUT_MAX_CHARS: usize = 18;
+
+    fn nameworld_panel_and_field(size: PhysicalSize<u32>) -> (f64, f64, f64, f64, f64) {
+        // Mismas medidas que `push_menu_panel_background` +
+        // `push_menu_title` en ui_overlay.rs — repetidas acá a propósito
+        // (sin depender de ui_overlay desde touch.rs) para no crear una
+        // dependencia circular; si cambia el panel ahí, hay que
+        // actualizar esto también (ver comentario largo al respecto en
+        // `rect_settings_row`, mismo patrón en el resto del archivo).
+        let sw = size.width as f64;
+        let sh = size.height as f64;
+        let cx = sw * 0.5;
+        let panel_w = 520.0_f64.min(sw * 0.85);
+        let panel_h = sh * 0.78;
+        let panel_x = cx - panel_w * 0.5;
+        let panel_y = sh * 0.14;
+        // title_y (panel_y + 22) + alto de fuente grande (7*4=28) + 16 = separador.
+        let sep_y = panel_y + 22.0 + 28.0 + 16.0;
+        (panel_x, panel_y, panel_w, panel_h, sep_y)
+    }
+
+    /// Cuadro de texto que muestra el nombre que se está escribiendo.
+    pub(crate) fn rect_nameworld_textfield(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let (panel_x, _, panel_w, _, sep_y) = Self::nameworld_panel_and_field(size);
+        (panel_x + 20.0, sep_y + 16.0, panel_w - 40.0, 50.0)
+    }
+
+    /// Botón "BORRAR" (ancho completo), justo debajo del cuadro de
+    /// texto. El IME nativo ya trae su propia tecla de borrar en varios
+    /// teclados, pero no en todos (y en desktop es cómodo tener un
+    /// botón tocable), así que lo dejamos como acción explícita.
+    pub(crate) fn rect_nameworld_backspace(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let field = Self::rect_nameworld_textfield(size);
+        (field.0, field.1 + field.3 + 18.0, field.2, 48.0)
+    }
+
+    /// Botón grande "CREAR MUNDO", debajo de "BORRAR".
+    pub(crate) fn rect_nameworld_confirm(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let field = Self::rect_nameworld_textfield(size);
+        let backspace = Self::rect_nameworld_backspace(size);
+        let y = backspace.1 + backspace.3 + 14.0;
+        (field.0, y, field.2, 56.0)
+    }
+
+    fn hit_nameworld(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if Self::point_in_rect(pos, Self::rect_back_button(size)) {
+            return Some(TouchAction::Back);
+        }
+        if Self::point_in_rect(pos, Self::rect_nameworld_backspace(size)) {
+            return Some(TouchAction::KeyboardBackspace);
+        }
+        if Self::point_in_rect(pos, Self::rect_nameworld_confirm(size)) {
+            return Some(TouchAction::ConfirmNameWorld);
+        }
+        None
+    }
+
+    pub fn on_touch_nameworld(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if touch.phase != TouchPhase::Started {
+            return None;
+        }
+        Self::hit_nameworld((touch.location.x, touch.location.y), size)
+    }
+
+    pub fn on_click_nameworld(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        Self::hit_nameworld(pos, size)
+    }
+
+    // --- Confirmación de borrado (WorldList -> ConfirmDeleteWorld) ---
+
+    pub(crate) fn rect_confirmdelete_cancel_button(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let (panel_x, panel_y, panel_w, panel_h, _) = Self::nameworld_panel_and_field(size);
+        let gap = 16.0;
+        let btn_w = (panel_w - 40.0 - gap) * 0.5;
+        let y = panel_y + panel_h - 56.0 - 30.0;
+        (panel_x + 20.0, y, btn_w, 56.0)
+    }
+
+    pub(crate) fn rect_confirmdelete_confirm_button(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let cancel = Self::rect_confirmdelete_cancel_button(size);
+        let gap = 16.0;
+        (cancel.0 + cancel.2 + gap, cancel.1, cancel.2, cancel.3)
+    }
+
+    fn hit_confirmdelete(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if Self::point_in_rect(pos, Self::rect_back_button(size)) {
+            return Some(TouchAction::Back);
+        }
+        if Self::point_in_rect(pos, Self::rect_confirmdelete_cancel_button(size)) {
+            return Some(TouchAction::Back);
+        }
+        if Self::point_in_rect(pos, Self::rect_confirmdelete_confirm_button(size)) {
+            return Some(TouchAction::ConfirmDeleteWorld);
+        }
+        None
+    }
+
+    pub fn on_touch_confirmdelete(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if touch.phase != TouchPhase::Started {
+            return None;
+        }
+        Self::hit_confirmdelete((touch.location.x, touch.location.y), size)
+    }
+
+    pub fn on_click_confirmdelete(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        Self::hit_confirmdelete(pos, size)
     }
 
     // --- Menú de pausa (Playing -> Pause): 3 botones grandes apilados ---
@@ -317,6 +546,12 @@ impl TouchController {
     /// info de build.
     pub(crate) fn rect_settings_debug_panel_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
         let (x, y, w, h) = Self::rect_settings_build_info_row(size);
+        (x, y + h + 14.0, w, h)
+    }
+
+    /// Fila del intervalo de autoguardado, justo debajo del panel de debug.
+    pub(crate) fn rect_settings_autosave_row(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let (x, y, w, h) = Self::rect_settings_debug_panel_row(size);
         (x, y + h + 14.0, w, h)
     }
 
@@ -505,15 +740,76 @@ impl TouchController {
         should_break
     }
 
-    /// Procesa un evento táctil durante el menú de pausa (Playing ->
-    /// Pause): sus 3 botones ("MODO DE JUEGO", "AJUSTES", "SALIR") y
-    /// "< VOLVER" para reanudar el juego directamente.
-    pub fn on_touch_pause(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+    /// Hit-test del menú principal ("JUGAR" / "CONFIGURACIÓN" / "SALIR"),
+    /// compartido entre `on_touch_main_menu` (Android) y
+    /// `on_click_main_menu` (mouse en desktop) — la única fuente de
+    /// verdad para dónde caen los 3 botones, en línea con el resto de
+    /// este archivo.
+    fn hit_main_menu(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if Self::point_in_rect(pos, Self::rect_main_menu_button(size, 0)) {
+            return Some(TouchAction::PlayGame);
+        }
+        if Self::point_in_rect(pos, Self::rect_main_menu_button(size, 1)) {
+            return Some(TouchAction::OpenSettingsScreen);
+        }
+        if Self::point_in_rect(pos, Self::rect_main_menu_button(size, 2)) {
+            return Some(TouchAction::ExitApp);
+        }
+        None
+    }
+
+    /// Procesa un evento táctil en el menú principal (Android).
+    pub fn on_touch_main_menu(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
         if touch.phase != TouchPhase::Started {
             return None;
         }
-        let pos = (touch.location.x, touch.location.y);
+        Self::hit_main_menu((touch.location.x, touch.location.y), size)
+    }
 
+    /// Procesa un click de mouse en el menú principal (desktop). `pos` es
+    /// la última posición conocida del cursor (ver `CursorMoved` en
+    /// lib.rs), ya que un `MouseInput` no trae su propia coordenada.
+    pub fn on_click_main_menu(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        Self::hit_main_menu(pos, size)
+    }
+
+    /// Hit-test de la lista de mundos: "< VOLVER", "+ CREAR MUNDO NUEVO",
+    /// el ícono de borrar y cada fila de mundo guardado (hasta
+    /// `WORLDLIST_MAX_ROWS`). `world_count` es cuántos mundos hay
+    /// realmente en la lista, para no devolver `SelectWorld`/
+    /// `RequestDeleteWorld` de una fila que no tiene mundo debajo.
+    fn hit_worldlist(pos: (f64, f64), size: PhysicalSize<u32>, world_count: usize) -> Option<TouchAction> {
+        if Self::point_in_rect(pos, Self::rect_back_button(size)) {
+            return Some(TouchAction::Back);
+        }
+        if Self::point_in_rect(pos, Self::rect_worldlist_create_button(size)) {
+            return Some(TouchAction::OpenNameWorld);
+        }
+        for i in 0..world_count.min(Self::WORLDLIST_MAX_ROWS) {
+            if Self::point_in_rect(pos, Self::rect_worldlist_delete_button(size, i)) {
+                return Some(TouchAction::RequestDeleteWorld(i));
+            }
+            if Self::point_in_rect(pos, Self::rect_worldlist_row(size, i)) {
+                return Some(TouchAction::SelectWorld(i));
+            }
+        }
+        None
+    }
+
+    /// Procesa un evento táctil en la lista de mundos (Android).
+    pub fn on_touch_worldlist(&self, touch: Touch, size: PhysicalSize<u32>, world_count: usize) -> Option<TouchAction> {
+        if touch.phase != TouchPhase::Started {
+            return None;
+        }
+        Self::hit_worldlist((touch.location.x, touch.location.y), size, world_count)
+    }
+
+    /// Equivalente de `on_touch_worldlist` para un click de mouse (desktop).
+    pub fn on_click_worldlist(&self, pos: (f64, f64), size: PhysicalSize<u32>, world_count: usize) -> Option<TouchAction> {
+        Self::hit_worldlist(pos, size, world_count)
+    }
+
+    fn hit_pause(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
         if Self::point_in_rect(pos, Self::rect_back_button(size)) {
             return Some(TouchAction::Back);
         }
@@ -529,14 +825,22 @@ impl TouchController {
         None
     }
 
-    /// Procesa un evento táctil durante el selector de modo de juego
-    /// (Pause -> GameMode).
-    pub fn on_touch_gamemode(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+    /// Procesa un evento táctil durante el menú de pausa (Playing ->
+    /// Pause): sus 3 botones ("MODO DE JUEGO", "AJUSTES", "SALIR") y
+    /// "< VOLVER" para reanudar el juego directamente.
+    pub fn on_touch_pause(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
         if touch.phase != TouchPhase::Started {
             return None;
         }
-        let pos = (touch.location.x, touch.location.y);
+        Self::hit_pause((touch.location.x, touch.location.y), size)
+    }
 
+    /// Equivalente de `on_touch_pause` para un click de mouse (desktop).
+    pub fn on_click_pause(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        Self::hit_pause(pos, size)
+    }
+
+    fn hit_gamemode(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
         if Self::point_in_rect(pos, Self::rect_back_button(size)) {
             return Some(TouchAction::Back);
         }
@@ -548,22 +852,27 @@ impl TouchController {
         None
     }
 
-    /// Procesa un evento táctil durante la pantalla de ajustes
-    /// principales (Pause -> Settings): FPS, radio de chunks, nubes,
-    /// niebla, y el botón "AJUSTES ADICIONALES".
-    pub fn on_touch_settings(
-        &self,
-        touch: Touch,
+    /// Procesa un evento táctil durante el selector de modo de juego
+    /// (Pause -> GameMode).
+    pub fn on_touch_gamemode(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if touch.phase != TouchPhase::Started {
+            return None;
+        }
+        Self::hit_gamemode((touch.location.x, touch.location.y), size)
+    }
+
+    /// Equivalente de `on_touch_gamemode` para un click de mouse (desktop).
+    pub fn on_click_gamemode(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        Self::hit_gamemode(pos, size)
+    }
+
+    fn hit_settings(
+        pos: (f64, f64),
         size: PhysicalSize<u32>,
         show_fps: bool,
         show_clouds: bool,
         show_fog: bool,
     ) -> Option<TouchAction> {
-        if touch.phase != TouchPhase::Started {
-            return None;
-        }
-        let pos = (touch.location.x, touch.location.y);
-
         if Self::point_in_rect(pos, Self::rect_back_button(size)) {
             return Some(TouchAction::Back);
         }
@@ -607,20 +916,40 @@ impl TouchController {
     }
 
     /// Procesa un evento táctil durante la pantalla de ajustes
-    /// adicionales (Settings -> SettingsMore): info de build y panel de
-    /// debug.
-    pub fn on_touch_settings_more(
+    /// principales (Pause -> Settings): FPS, radio de chunks, nubes,
+    /// niebla, y el botón "AJUSTES ADICIONALES".
+    pub fn on_touch_settings(
         &self,
         touch: Touch,
         size: PhysicalSize<u32>,
-        show_build_info: bool,
-        show_debug_panel: bool,
+        show_fps: bool,
+        show_clouds: bool,
+        show_fog: bool,
     ) -> Option<TouchAction> {
         if touch.phase != TouchPhase::Started {
             return None;
         }
-        let pos = (touch.location.x, touch.location.y);
+        Self::hit_settings((touch.location.x, touch.location.y), size, show_fps, show_clouds, show_fog)
+    }
 
+    /// Equivalente de `on_touch_settings` para un click de mouse (desktop).
+    pub fn on_click_settings(
+        &self,
+        pos: (f64, f64),
+        size: PhysicalSize<u32>,
+        show_fps: bool,
+        show_clouds: bool,
+        show_fog: bool,
+    ) -> Option<TouchAction> {
+        Self::hit_settings(pos, size, show_fps, show_clouds, show_fog)
+    }
+
+    fn hit_settings_more(
+        pos: (f64, f64),
+        size: PhysicalSize<u32>,
+        show_build_info: bool,
+        show_debug_panel: bool,
+    ) -> Option<TouchAction> {
         if Self::point_in_rect(pos, Self::rect_back_button(size)) {
             return Some(TouchAction::Back);
         }
@@ -635,9 +964,42 @@ impl TouchController {
             return Some(TouchAction::ToggleDebugPanel);
         }
 
+        let autosave_row = Self::rect_settings_autosave_row(size);
+        if Self::point_in_rect(pos, autosave_row) {
+            return Some(TouchAction::CycleAutosaveInterval);
+        }
+
         let _ = (show_build_info, show_debug_panel);
 
         None
+    }
+
+    /// Procesa un evento táctil durante la pantalla de ajustes
+    /// adicionales (Settings -> SettingsMore): info de build y panel de
+    /// debug.
+    pub fn on_touch_settings_more(
+        &self,
+        touch: Touch,
+        size: PhysicalSize<u32>,
+        show_build_info: bool,
+        show_debug_panel: bool,
+    ) -> Option<TouchAction> {
+        if touch.phase != TouchPhase::Started {
+            return None;
+        }
+        Self::hit_settings_more((touch.location.x, touch.location.y), size, show_build_info, show_debug_panel)
+    }
+
+    /// Equivalente de `on_touch_settings_more` para un click de mouse
+    /// (desktop).
+    pub fn on_click_settings_more(
+        &self,
+        pos: (f64, f64),
+        size: PhysicalSize<u32>,
+        show_build_info: bool,
+        show_debug_panel: bool,
+    ) -> Option<TouchAction> {
+        Self::hit_settings_more(pos, size, show_build_info, show_debug_panel)
     }
 
     pub fn move_axis(&self) -> (f32, f32) {

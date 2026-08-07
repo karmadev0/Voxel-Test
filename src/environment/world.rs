@@ -21,16 +21,36 @@ pub struct World {
     // (por romper/colocar bloques). Solo estos se re-escriben al guardar,
     // en vez de reescribir el mundo entero cada vez.
     dirty_for_save: HashSet<(i32, i32)>,
+    // Semilla original con la que se creó este mundo. Solo se usa para
+    // reconstruir un `World` equivalente en `SavedSession` (ver lib.rs,
+    // Android suspender/resumir) — el generador en sí no expone la suya.
+    seed: u32,
 }
 
 impl World {
-    pub fn new(seed: u32) -> Self {
+    /// `save_dir` es la carpeta donde se guardan/leen los chunks de ESTE
+    /// mundo en particular (ver `save_manager::world_dir`, que arma una
+    /// carpeta distinta por cada mundo guardado desde la lista de
+    /// mundos) — ya no un único `world_save/` fijo compartido por todas
+    /// las partidas.
+    pub fn new(seed: u32, save_dir: PathBuf) -> Self {
         Self {
             chunks: HashMap::new(),
             generator: Arc::new(WorldGenerator::new(seed)),
-            save_dir: PathBuf::from("world_save"),
+            save_dir,
             dirty_for_save: HashSet::new(),
+            seed,
         }
+    }
+
+    /// Semilla con la que se creó este mundo (ver campo `seed`).
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
+    /// Carpeta de guardado de este mundo (ver campo `save_dir`).
+    pub fn save_dir(&self) -> &std::path::Path {
+        &self.save_dir
     }
 
     fn chunk_file_path(&self, cx: i32, cz: i32) -> PathBuf {

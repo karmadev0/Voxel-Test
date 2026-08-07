@@ -22,6 +22,7 @@ use engine::render_state::Uniforms;
 use environment::chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Z};
 use environment::mesher::Vertex;
 use environment::sky::{FOG_START_FRACTION, SKY_COLOR};
+use environment::save_manager::WorldMeta;
 use environment::world::{raycast, World};
 use logic::immersive;
 use logic::touch::{TouchAction, TouchController};
@@ -51,14 +52,38 @@ use winit::platform::android::activity::AndroidApp;
 /// Jerarquía de menús (botón "< VOLVER" y Esc suben un nivel, ver
 /// `TouchAction::Back` y el manejo de Escape en `window_event`):
 ///
-///   Playing
-///     └─ Pause              ("MODO DE JUEGO" / "AJUSTES" / "SALIR")
-///          ├─ GameMode      (selector Supervivencia/Creativo/Espectador)
-///          └─ Settings      (FPS, radio de chunks, nubes, niebla + botón
-///               │            "AJUSTES ADICIONALES")
-///               └─ SettingsMore  (info de build, panel de debug)
+///   MainMenu                ("JUGAR" / "CONFIGURACIÓN" / "SALIR", raíz)
+///     ├─ Settings           (alcanzable también desde acá, ver
+///     │                       `State::settings_return`)
+///     ├─ WorldList          ("+ CREAR MUNDO NUEVO" + mundos guardados)
+///     │    ├─ NameWorld          (teclado en pantalla, al crear)
+///     │    └─ ConfirmDeleteWorld (al tocar el ícono de borrar de una fila)
+///     └─ Playing
+///          └─ Pause              ("MODO DE JUEGO" / "AJUSTES" / "SALIR")
+///               ├─ GameMode      (selector Supervivencia/Creativo/Espectador)
+///               └─ Settings      (FPS, radio de chunks, nubes, niebla + botón
+///                    │            "AJUSTES ADICIONALES")
+///                    └─ SettingsMore  (info de build, panel de debug)
+///
+/// `Settings` es la única pantalla alcanzable desde dos padres distintos
+/// (`MainMenu` y `Pause`) — de ahí `State::settings_return`, que guarda
+/// a cuál de los dos hay que volver con "< VOLVER".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameScreen {
+    /// Menú principal: primera pantalla al abrir la app, y a la que se
+    /// vuelve al salir de una partida (ver `TouchAction::ExitGame`).
+    MainMenu,
+    /// Lista de mundos guardados + "CREAR MUNDO NUEVO", alcanzable desde
+    /// "JUGAR" en el menú principal (ver `TouchAction::PlayGame`).
+    WorldList,
+    /// Teclado en pantalla para elegir el nombre del mundo nuevo, entre
+    /// `WorldList` y crear el mundo de verdad (ver
+    /// `TouchAction::OpenNameWorld`/`ConfirmNameWorld`).
+    NameWorld,
+    /// Confirmación antes de borrar un mundo de la lista (ver
+    /// `TouchAction::RequestDeleteWorld`/`ConfirmDeleteWorld`), para que
+    /// tocar el ícono de borrar por error no se lleve puesto el mundo.
+    ConfirmDeleteWorld,
     /// Juego corriendo normalmente.
     Playing,
     /// Menú de pausa (antes esto era la única pantalla de
@@ -67,7 +92,7 @@ enum GameScreen {
     /// Selector de modo de juego, fullscreen, abierto desde Pause.
     GameMode,
     /// Ajustes de uso más frecuente (FPS, radio de chunks, nubes,
-    /// niebla), fullscreen, abierto desde Pause.
+    /// niebla), fullscreen, abierto desde Pause o desde MainMenu.
     Settings,
     /// Ajustes menos frecuentes (info de build, panel de debug),
     /// fullscreen, abierto desde Settings vía "AJUSTES ADICIONALES".
@@ -192,6 +217,14 @@ const DEFAULT_RENDER_RADIUS: i32 = 4;
 const MIN_RENDER_RADIUS: i32 = 1;
 const MAX_RENDER_RADIUS: i32 = 128;
 
+/// Opciones cíclicas del intervalo de autoguardado, en segundos, fila
+/// "AUTOGUARDADO" de la pantalla de ajustes adicionales (ver
+/// `TouchAction::CycleAutosaveInterval`). 60s es el default pedido
+/// originalmente; el resto da margen para partidas más tranquilas (5
+/// min) o dispositivos donde preferís perder como mucho 15s de progreso.
+const AUTOSAVE_OPTIONS_SECS: [u32; 5] = [15, 30, 60, 120, 300];
+const DEFAULT_AUTOSAVE_SECS: u32 = 60;
+
 /// Cuántos chunks recién llegados del hilo de fondo se convierten a
 /// buffers de GPU por frame como máximo. Crear un `wgpu::Buffer` no es
 /// gratis (aunque sea rápido comparado con generar+mallear el chunk), así
@@ -306,49 +339,76 @@ struct State {
 
     /// Pantalla activa (ver `GameScreen`).
     game_screen: GameScreen,
+    /// A qué pantalla volver al tocar "< VOLVER" desde `Settings`, ya
+    /// que esa pantalla es alcanzable tanto desde `MainMenu` como desde
+    /// `Pause` (ver el diagrama en `GameScreen`). Se actualiza cada vez
+    /// que se abre `Settings` (`TouchAction::OpenSettingsScreen`), a
+    /// partir de la pantalla en la que estábamos parados en ese momento.
+    settings_return: GameScreen,
+    /// Última posición conocida del cursor del mouse, en píxeles
+    /// físicos (ver `WindowEvent::CursorMoved`). Solo se usa en
+    /// desktop, para poder hacer hit-test de los botones de las
+    /// pantallas de menú con un click — a diferencia de Android, un
+    /// `WindowEvent::MouseInput` no trae su propia coordenada.
+    cursor_pos: (f64, f64),
+
+    /// Mundos guardados disponibles, refrescado cada vez que se entra a
+    /// `GameScreen::WorldList` (ver `TouchAction::PlayGame`). La lista
+    /// en sí vive en disco (`save_manager::list_worlds`); esto es sólo
+    /// una copia para que `render`/hit-testing no tengan que leer el
+    /// filesystem en cada frame.
+    available_worlds: Vec<WorldMeta>,
+    /// Nombre del mundo actualmente cargado, si hay uno. `None` antes de
+    /// entrar a jugar por primera vez (arranque en `MainMenu`).
+    current_world_name: Option<String>,
+
+    /// Nombre que se está escribiendo en `GameScreen::NameWorld`, tecla
+    /// a tecla (ver `TouchAction::KeyboardChar`/`KeyboardBackspace`).
+    /// Se prellena con `save_manager::next_free_name()` al abrir esa
+    /// pantalla (`TouchAction::OpenNameWorld`) y se usa tal cual al
+    /// confirmar (`ConfirmNameWorld`) — si queda vacío, se vuelve a
+    /// generar un nombre por defecto en vez de crear un mundo sin
+    /// nombre.
+    name_input: String,
+    /// Texto en composición del IME (`Ime::Preedit`) mientras se está
+    /// tipeando en `GameScreen::NameWorld` — por ejemplo, sílabas que
+    /// todavía no se confirmaron en un IME de predicción/CJK, o el
+    /// candidato resaltado antes de tocar "espacio"/aceptar. Se muestra
+    /// pegado a `name_input` con otro color (ver
+    /// `ui_overlay::build_nameworld_screen`) pero NO se agrega a
+    /// `name_input` hasta que llega `Ime::Commit` — eso es justamente lo
+    /// que distingue "todavía escribiendo" de "ya confirmado". Se limpia
+    /// al entrar/salir de `NameWorld` y en cada `Ime::Commit`/`Disabled`.
+    name_preedit: String,
+    /// Índice en `available_worlds` del mundo que se va a borrar,
+    /// mientras `GameScreen::ConfirmDeleteWorld` está en pantalla (ver
+    /// `TouchAction::RequestDeleteWorld`). `None` el resto del tiempo.
+    pending_delete_index: Option<usize>,
+
+    /// Cada cuántos segundos se autoguarda mientras se juega (ver
+    /// `update`, chequeo contra `last_autosave`). Ajustable en vivo desde
+    /// "AJUSTES ADICIONALES" → fila "AUTOGUARDADO" (ver
+    /// `AUTOSAVE_OPTIONS_SECS`).
+    autosave_interval_secs: u32,
+    /// Último instante en que corrió el autoguardado (o en que arrancó/
+    /// se cargó la partida, como punto de partida). Comparado contra
+    /// `autosave_interval_secs` en cada `update()` mientras se está
+    /// jugando.
+    last_autosave: Instant,
 }
 
 impl State {
     async fn new(window: Arc<winit::window::Window>) -> Self {
         let render = engine::render_state::RenderState::new(window).await;
 
-        // --- Generación de mundo (paralela con rayon) ---
-        log::info!("Generando terreno...");
-        let mut world = World::new(1337);
-        world.generate_area(DEFAULT_RENDER_RADIUS);
-
-        // Malleamos (greedy meshing) todos los chunks generados, en
-        // paralelo, aprovechando los 2 núcleos / 2 hilos del Celeron N4000.
-        // Como para la carga inicial TODOS los chunks del radio ya están
-        // en `world.chunks` antes de mallear ninguno, cada chunk ve a sus
-        // vecinos reales (Fase 5: culling consciente de vecinos) excepto
-        // en el borde exterior del radio, donde no hay más remedio que
-        // tratar "fuera del mundo cargado" como aire.
-        let coords: Vec<(i32, i32)> = world.chunks.keys().copied().collect();
-        let mesh_data: Vec<((i32, i32), environment::mesher::MeshData)> = coords
-            .par_iter()
-            .map(|&(cx, cz)| {
-                let mesh = world.generate_chunk_mesh(cx, cz).unwrap_or(environment::mesher::MeshData {
-                    vertices: Vec::new(),
-                    indices: Vec::new(),
-                });
-                ((cx, cz), mesh)
-            })
-            .collect();
-
-        log::info!(
-            "Terreno generado: {} chunks, {} vértices totales",
-            mesh_data.len(),
-            mesh_data.iter().map(|(_, m)| m.vertices.len()).sum::<usize>()
-        );
-
-        let mut chunk_meshes: HashMap<(i32, i32), ChunkMesh> = HashMap::new();
-        for ((cx, cz), mesh) in mesh_data {
-            if mesh.indices.is_empty() {
-                continue;
-            }
-            chunk_meshes.insert((cx, cz), build_chunk_mesh(&render.device, cx, cz, &mesh));
-        }
+        // Ya no se genera terreno acá: la app arranca en `MainMenu` y el
+        // mundo de verdad recién se crea/carga cuando el jugador elige
+        // uno en la lista de mundos (ver `State::start_world`, disparado
+        // desde `TouchAction::SelectWorld`/`CreateNewWorld`). Acá solo
+        // dejamos un `World` vacío de relleno para no tener que hacer
+        // `Option<World>` en todos lados.
+        let world = World::new(0, std::path::PathBuf::new());
+        let chunk_meshes: HashMap<(i32, i32), ChunkMesh> = HashMap::new();
 
         let camera = Camera::new(glam::Vec3::new(8.0, 40.0, 8.0));
         let player = Player::new(glam::Vec3::new(8.0, 40.0, 8.0));
@@ -379,7 +439,9 @@ impl State {
             debug_copy_flash_until: None,
             rescue_cooldown_until: None,
             rescue_target: None,
-            game_screen: GameScreen::Playing,
+            game_screen: GameScreen::MainMenu,
+            settings_return: GameScreen::MainMenu,
+            cursor_pos: (0.0, 0.0),
             current_player_chunk: (0, 0),
             render_radius: DEFAULT_RENDER_RADIUS,
             last_streamed_render_radius: DEFAULT_RENDER_RADIUS,
@@ -387,6 +449,186 @@ impl State {
             pending_chunks: std::collections::HashSet::new(),
             chunk_result_tx,
             chunk_result_rx,
+            available_worlds: Vec::new(),
+            current_world_name: None,
+            name_input: String::new(),
+            name_preedit: String::new(),
+            pending_delete_index: None,
+            autosave_interval_secs: DEFAULT_AUTOSAVE_SECS,
+            last_autosave: Instant::now(),
+        }
+    }
+
+    /// Carga (genera el terreno inicial de) el mundo descripto por
+    /// `meta` y entra a jugar. Es el único punto donde se construye un
+    /// `World` "de verdad" con contenido — reemplaza lo que antes hacía
+    /// `State::new` de una: generar el área inicial, mallear todos esos
+    /// chunks en paralelo con rayon, y subirlos a la GPU. Sirve tanto
+    /// para `SelectWorld` (mundo ya existente) como para `CreateNewWorld`
+    /// (mundo recién creado, sin chunks guardados todavía — ahí
+    /// `generate_area` genera en vez de leer de disco, ver `ChunkLoader`).
+    fn start_world(&mut self, meta: WorldMeta) {
+        log::info!("Cargando mundo '{}' (semilla {})...", meta.name, meta.seed);
+        let save_dir = environment::save_manager::world_dir(&meta.name);
+        let mut world = World::new(meta.seed, save_dir);
+        world.generate_area(self.render_radius);
+
+        let coords: Vec<(i32, i32)> = world.chunks.keys().copied().collect();
+        let mesh_data: Vec<((i32, i32), environment::mesher::MeshData)> = coords
+            .par_iter()
+            .map(|&(cx, cz)| {
+                let mesh = world.generate_chunk_mesh(cx, cz).unwrap_or(environment::mesher::MeshData {
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                });
+                ((cx, cz), mesh)
+            })
+            .collect();
+
+        let mut chunk_meshes: HashMap<(i32, i32), ChunkMesh> = HashMap::new();
+        for ((cx, cz), mesh) in mesh_data {
+            if mesh.indices.is_empty() {
+                continue;
+            }
+            chunk_meshes.insert((cx, cz), build_chunk_mesh(&self.render.device, cx, cz, &mesh));
+        }
+
+        self.chunk_loader = world.loader();
+        self.world = world;
+        self.chunk_meshes = chunk_meshes;
+        self.pending_chunks.clear();
+        // Por si quedó algún resultado pendiente de un mundo anterior
+        // dando vueltas en el canal (no debería, pero así no se filtra
+        // un chunk del mundo viejo al nuevo si justo llegó tarde).
+        while self.chunk_result_rx.try_recv().is_ok() {}
+
+        self.camera = Camera::new(glam::Vec3::new(8.0, 40.0, 8.0));
+        self.player = Player::new(glam::Vec3::new(8.0, 40.0, 8.0));
+        self.game_mode = GameMode::Survival;
+        self.current_player_chunk = (0, 0);
+        self.last_streamed_render_radius = self.render_radius;
+        self.current_world_name = Some(meta.name);
+        self.last_autosave = Instant::now();
+
+        self.game_screen = GameScreen::Playing;
+        self.last_frame = Instant::now();
+    }
+
+    /// Arma un `SavedSession` con todo lo necesario para restaurar la
+    /// partida actual en otra superficie/dispositivo wgpu (ver comentario
+    /// de `SavedSession`). Solo tiene sentido llamarla con un mundo
+    /// cargado (`current_world_name.is_some()`) — la llamamos desde
+    /// `App::suspended` justo después de chequear eso.
+    fn to_session(&self) -> SavedSession {
+        SavedSession {
+            world_name: self.current_world_name.clone(),
+            chunks: self.world.chunks.clone(),
+            seed: self.world.seed(),
+            save_dir: self.world.save_dir().to_path_buf(),
+            camera: self.camera.clone(),
+            player: self.player.clone(),
+            game_mode: self.game_mode,
+            selected_block: self.selected_block,
+            // Si justo estábamos en un menú (pausa, ajustes, etc.)
+            // cuando Android mandó la app a segundo plano, restauramos
+            // en ese mismo menú en vez de forzar `Playing` — pero si
+            // estábamos jugando de verdad, entrar de nuevo directo a
+            // `Playing` (sin pasar por pausa) sería una sorpresa
+            // desagradable después de haber estado en otra app, así que
+            // ahí sí forzamos `Pause`.
+            game_screen: if self.game_screen == GameScreen::Playing {
+                GameScreen::Pause
+            } else {
+                self.game_screen
+            },
+            settings_return: self.settings_return,
+            render_radius: self.render_radius,
+            show_fps: self.show_fps,
+            show_clouds: self.show_clouds,
+            show_fog: self.show_fog,
+            show_build_info: self.show_build_info,
+            show_debug_panel: self.show_debug_panel,
+            autosave_interval_secs: self.autosave_interval_secs,
+        }
+    }
+
+    /// Reconstruye un `State` a partir de un `SavedSession` (ver
+    /// `App::resumed`): recrea el dispositivo/superficie wgpu (lo único
+    /// que de verdad hacía falta tirar en `suspended()`) y los buffers
+    /// de GPU de cada chunk, pero reusa los chunks, la cámara, el
+    /// jugador y los ajustes tal cual estaban — no vuelve a generar ni a
+    /// leer nada de disco que no hiciera falta.
+    async fn resume(window: Arc<winit::window::Window>, session: SavedSession) -> Self {
+        let render = engine::render_state::RenderState::new(window).await;
+
+        let mut world = World::new(session.seed, session.save_dir);
+        for (&(cx, cz), chunk) in session.chunks.iter() {
+            world.insert_loaded_chunk(cx, cz, chunk.clone());
+        }
+
+        let coords: Vec<(i32, i32)> = world.chunks.keys().copied().collect();
+        let mesh_data: Vec<((i32, i32), environment::mesher::MeshData)> = coords
+            .par_iter()
+            .map(|&(cx, cz)| {
+                let mesh = world.generate_chunk_mesh(cx, cz).unwrap_or(environment::mesher::MeshData {
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                });
+                ((cx, cz), mesh)
+            })
+            .collect();
+
+        let mut chunk_meshes: HashMap<(i32, i32), ChunkMesh> = HashMap::new();
+        for ((cx, cz), mesh) in mesh_data {
+            if mesh.indices.is_empty() {
+                continue;
+            }
+            chunk_meshes.insert((cx, cz), build_chunk_mesh(&render.device, cx, cz, &mesh));
+        }
+
+        let chunk_loader = world.loader();
+        let (chunk_result_tx, chunk_result_rx) = std::sync::mpsc::channel();
+
+        Self {
+            render,
+            start_time: Instant::now(),
+            chunk_meshes,
+            world,
+            camera: session.camera,
+            player: session.player,
+            game_mode: session.game_mode,
+            selected_block: session.selected_block,
+            mouse_captured: false,
+            last_frame: Instant::now(),
+            touch: TouchController::new(),
+            fps_frame_count: 0,
+            fps_timer: Instant::now(),
+            current_fps: 0.0,
+            show_fps: session.show_fps,
+            show_clouds: session.show_clouds,
+            show_fog: session.show_fog,
+            show_build_info: session.show_build_info,
+            show_debug_panel: session.show_debug_panel,
+            debug_copy_flash_until: None,
+            rescue_cooldown_until: None,
+            rescue_target: None,
+            game_screen: session.game_screen,
+            settings_return: session.settings_return,
+            cursor_pos: (0.0, 0.0),
+            current_player_chunk: World::world_pos_to_chunk(session.player.feet_position.x, session.player.feet_position.z),
+            render_radius: session.render_radius,
+            last_streamed_render_radius: session.render_radius,
+            chunk_loader,
+            pending_chunks: std::collections::HashSet::new(),
+            chunk_result_tx,
+            chunk_result_rx,
+            available_worlds: Vec::new(),
+            current_world_name: session.world_name,
+            name_input: String::new(),
+            name_preedit: String::new(),
+            pending_delete_index: None,
+            autosave_interval_secs: session.autosave_interval_secs,
+            last_autosave: Instant::now(),
         }
     }
 
@@ -489,6 +731,214 @@ impl State {
         }
         self.game_mode = mode;
         log::info!("Modo de juego cambiado a {}", mode.label());
+    }
+
+    /// Aplica un `TouchAction` disparado desde cualquier pantalla de menú
+    /// (MainMenu, Pause, GameMode, Settings, SettingsMore). Punto de
+    /// entrada único tanto para eventos táctiles (Android) como para
+    /// clicks de mouse (desktop, ver `WindowEvent::MouseInput`) — así las
+    /// dos entradas de input nunca pueden desincronizarse en qué hace
+    /// cada botón.
+    fn apply_menu_action(&mut self, action: TouchAction, event_loop: &ActiveEventLoop, window: &Window) {
+        // Activamos el IME nativo (teclado del sistema) solo mientras
+        // `GameScreen::NameWorld` está en pantalla, y lo apagamos apenas
+        // se sale — así no queda un teclado fantasma habilitado
+        // mientras se juega. Comparamos antes/después en vez de mirar
+        // la acción en sí porque hay más de una forma de entrar/salir de
+        // `NameWorld` (`OpenNameWorld`, `ConfirmNameWorld`, `Back`).
+        let was_nameworld = self.game_screen == GameScreen::NameWorld;
+        self.apply_menu_action_inner(action, event_loop);
+        let is_nameworld = self.game_screen == GameScreen::NameWorld;
+        if was_nameworld != is_nameworld {
+            window.set_ime_allowed(is_nameworld);
+            if is_nameworld {
+                // Ancla el popup del IME (candidatos/predicción, o el
+                // recuadro que algunos teclados dibujan alrededor del
+                // campo activo) cerca del cuadro de texto en vez de en
+                // la esquina de la pantalla por defecto.
+                let field = TouchController::rect_nameworld_textfield(self.render.size);
+                window.set_ime_cursor_area(
+                    winit::dpi::PhysicalPosition::new(field.0 as i32, field.1 as i32),
+                    winit::dpi::PhysicalSize::new(field.2.max(1.0) as u32, field.3.max(1.0) as u32),
+                );
+            } else {
+                // Por las dudas: si algún día se agrega una forma de
+                // salir de `NameWorld` que no pase por `Back`/
+                // `ConfirmNameWorld` (los dos únicos lugares que hoy
+                // limpian `name_preedit` a mano), no queda preedit
+                // colgado la próxima vez que se abra esta pantalla.
+                self.name_preedit.clear();
+            }
+            // Al cerrarse el teclado del sistema, Android suele volver a
+            // mostrar las barras de estado/navegación (mismo reseteo de
+            // flags que ya pasa al recuperar foco, ver el comentario en
+            // `WindowEvent::Focused(true)` más abajo) — y a diferencia de
+            // ese caso, cerrar el teclado NO siempre dispara un ciclo de
+            // `Focused`, así que sin este llamado el juego podía quedar
+            // con las barras del sistema visibles después de escribir el
+            // nombre de un mundo.
+            #[cfg(target_os = "android")]
+            if was_nameworld && !is_nameworld {
+                immersive::apply_immersive_fullscreen();
+            }
+        }
+    }
+
+    fn apply_menu_action_inner(&mut self, action: TouchAction, event_loop: &ActiveEventLoop) {
+        match action {
+            TouchAction::Place => self.handle_click(MouseButton::Right),
+            TouchAction::SelectBlock(n) => {
+                self.selected_block = match n {
+                    1 => BlockType::Grass,
+                    2 => BlockType::Dirt,
+                    3 => BlockType::Stone,
+                    4 => BlockType::Wood,
+                    _ => BlockType::Leaves,
+                };
+            }
+            TouchAction::PlayGame => {
+                // "JUGAR" ya no entra directo: abre la lista de mundos
+                // guardados (refrescada desde disco acá mismo, por si se
+                // creó/borró algo mundo desde la última vez que se miró).
+                self.available_worlds = environment::save_manager::list_worlds();
+                self.game_screen = GameScreen::WorldList;
+            }
+            TouchAction::SelectWorld(index) => {
+                if let Some(meta) = self.available_worlds.get(index).cloned() {
+                    self.start_world(meta);
+                }
+            }
+            TouchAction::OpenNameWorld => {
+                // Prellenamos con un nombre por defecto: el jugador
+                // puede borrarlo entero y escribir el suyo, o dejarlo
+                // tal cual y tocar "CREAR MUNDO" directo.
+                self.name_input = environment::save_manager::next_free_name();
+                self.name_preedit.clear();
+                self.game_screen = GameScreen::NameWorld;
+            }
+            TouchAction::KeyboardChar(c) => {
+                if self.name_input.chars().count() < TouchController::NAME_INPUT_MAX_CHARS {
+                    self.name_input.push(c);
+                }
+            }
+            TouchAction::KeyboardBackspace => {
+                self.name_input.pop();
+            }
+            TouchAction::ConfirmNameWorld => {
+                let trimmed = self.name_input.trim();
+                let name = if trimmed.is_empty() {
+                    environment::save_manager::next_free_name()
+                } else {
+                    trimmed.to_string()
+                };
+                let meta = environment::save_manager::create_world(&name);
+                self.name_input.clear();
+                self.name_preedit.clear();
+                self.start_world(meta);
+            }
+            TouchAction::RequestDeleteWorld(index) => {
+                self.pending_delete_index = Some(index);
+                self.game_screen = GameScreen::ConfirmDeleteWorld;
+            }
+            TouchAction::ConfirmDeleteWorld => {
+                if let Some(index) = self.pending_delete_index.take() {
+                    if let Some(meta) = self.available_worlds.get(index) {
+                        environment::save_manager::delete_world(&meta.name);
+                    }
+                    self.available_worlds = environment::save_manager::list_worlds();
+                }
+                self.game_screen = GameScreen::WorldList;
+            }
+            TouchAction::OpenPause => {
+                self.game_screen = GameScreen::Pause;
+            }
+            TouchAction::OpenGameModeScreen => {
+                self.game_screen = GameScreen::GameMode;
+            }
+            TouchAction::OpenSettingsScreen => {
+                // Recordamos desde dónde se abrió (MainMenu o Pause) para
+                // que "< VOLVER" sepa a cuál de los dos regresar.
+                self.settings_return = self.game_screen;
+                self.game_screen = GameScreen::Settings;
+            }
+            TouchAction::OpenSettingsMore => {
+                self.game_screen = GameScreen::SettingsMore;
+            }
+            TouchAction::ExitGame => {
+                // "SALIR" del menú de pausa: NO cierra la app, guarda el
+                // mundo y vuelve al menú principal (ver `ExitApp` para
+                // cerrar la app de verdad, desde MainMenu).
+                let saved = self.world.save_dirty_chunks();
+                if saved > 0 {
+                    log::info!("Guardados {} chunks modificados al volver al menú principal.", saved);
+                }
+                self.game_screen = GameScreen::MainMenu;
+            }
+            TouchAction::ExitApp => {
+                event_loop.exit();
+            }
+            TouchAction::Back => {
+                // Sube un nivel en la jerarquía de menús (ver comentario
+                // de `GameScreen`). Desde Pause, "Volver" reanuda el
+                // juego. Desde Settings, vuelve a MainMenu o a Pause
+                // según de dónde se haya abierto (`settings_return`).
+                // Salir de NameWorld o ConfirmDeleteWorld sin confirmar
+                // no debe dejar basura de estado atrás: se descarta lo
+                // que se había escrito / qué mundo se iba a borrar.
+                self.name_input.clear();
+                self.name_preedit.clear();
+                self.pending_delete_index = None;
+                self.game_screen = match self.game_screen {
+                    GameScreen::GameMode => GameScreen::Pause,
+                    GameScreen::Settings => self.settings_return,
+                    GameScreen::SettingsMore => GameScreen::Settings,
+                    GameScreen::Pause => GameScreen::Playing,
+                    GameScreen::WorldList => GameScreen::MainMenu,
+                    GameScreen::NameWorld | GameScreen::ConfirmDeleteWorld => GameScreen::WorldList,
+                    GameScreen::MainMenu | GameScreen::Playing => self.game_screen,
+                };
+                if self.game_screen == GameScreen::Playing {
+                    // Reiniciamos last_frame para no acumular
+                    // un dt gigante después de la pausa.
+                    self.last_frame = std::time::Instant::now();
+                }
+            }
+            TouchAction::ToggleFps => {
+                self.show_fps = !self.show_fps;
+            }
+            TouchAction::SetGameMode(index) => {
+                self.set_game_mode(GameMode::from_index(index));
+            }
+            TouchAction::DecreaseRenderRadius => {
+                self.render_radius = (self.render_radius - 1).max(MIN_RENDER_RADIUS);
+            }
+            TouchAction::IncreaseRenderRadius => {
+                self.render_radius = (self.render_radius + 1).min(MAX_RENDER_RADIUS);
+            }
+            TouchAction::ToggleClouds => {
+                self.show_clouds = !self.show_clouds;
+            }
+            TouchAction::ToggleFog => {
+                self.show_fog = !self.show_fog;
+            }
+            TouchAction::ToggleBuildInfo => {
+                self.show_build_info = !self.show_build_info;
+            }
+            TouchAction::ToggleDebugPanel => {
+                self.show_debug_panel = !self.show_debug_panel;
+            }
+            TouchAction::CycleAutosaveInterval => {
+                let current_idx = AUTOSAVE_OPTIONS_SECS
+                    .iter()
+                    .position(|&s| s == self.autosave_interval_secs)
+                    .unwrap_or(0);
+                let next_idx = (current_idx + 1) % AUTOSAVE_OPTIONS_SECS.len();
+                self.autosave_interval_secs = AUTOSAVE_OPTIONS_SECS[next_idx];
+            }
+            TouchAction::CopyDebugSnapshot => {
+                self.copy_debug_snapshot();
+            }
+        }
     }
 
     /// Auto-rescate (paso 5, solo se llama cuando `game_mode.auto_rescue()`
@@ -957,6 +1407,21 @@ impl State {
             }
         }
 
+        // Autoguardado periódico: solo mientras se está jugando de
+        // verdad (estamos dentro del bloque gateado por `Playing` más
+        // arriba). Igual que el guardado manual (F5) o al salir al menú,
+        // solo re-escribe los chunks modificados desde el último
+        // guardado (ver `World::save_dirty_chunks`), así que en la
+        // mayoría de los frames donde toca autoguardar pero no se
+        // rompió/colocó nada, es prácticamente gratis.
+        if self.last_autosave.elapsed().as_secs() >= self.autosave_interval_secs as u64 {
+            self.last_autosave = Instant::now();
+            let saved = self.world.save_dirty_chunks();
+            if saved > 0 {
+                log::info!("Autoguardado: {} chunks escritos a disco.", saved);
+            }
+        }
+
         let aspect = self.render.config.width as f32 / self.render.config.height.max(1) as f32;
         let view_proj = projection_matrix(aspect) * self.camera.view_matrix();
 
@@ -1019,6 +1484,20 @@ impl State {
         // fullscreen encima del mundo congelado. En juego: mira +
         // controles.
         let ui_vertices = match self.game_screen {
+            GameScreen::MainMenu => ui_overlay::build_main_menu_screen(self.render.size),
+            GameScreen::WorldList => {
+                let names: Vec<String> = self.available_worlds.iter().map(|w| w.name.clone()).collect();
+                ui_overlay::build_worldlist_screen(self.render.size, &names)
+            }
+            GameScreen::NameWorld => ui_overlay::build_nameworld_screen(self.render.size, &self.name_input, &self.name_preedit),
+            GameScreen::ConfirmDeleteWorld => {
+                let name = self
+                    .pending_delete_index
+                    .and_then(|i| self.available_worlds.get(i))
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("");
+                ui_overlay::build_confirm_delete_screen(self.render.size, name)
+            }
             GameScreen::Pause => ui_overlay::build_pause_screen(self.render.size),
             GameScreen::GameMode => {
                 ui_overlay::build_gamemode_screen(self.render.size, self.game_mode.index())
@@ -1034,6 +1513,7 @@ impl State {
                 self.render.size,
                 self.show_build_info,
                 self.show_debug_panel,
+                self.autosave_interval_secs,
             ),
             GameScreen::Playing => {
                 let mut verts = ui_overlay::build_crosshair(self.render.size);
@@ -1359,6 +1839,37 @@ pub fn run_desktop() {
 /// en reemplazo del closure único que usaba `event_loop.run(...)` en 0.29).
 /// Contiene lo mismo que antes vivía como variables capturadas por el closure.
 #[derive(Default)]
+/// Snapshot en RAM de la partida en curso, armado en `suspended()` justo
+/// antes de soltar el `State` (y con él, el `wgpu::Surface` que Android
+/// ya invalidó al mandar la Activity a segundo plano). Sin esto,
+/// `resumed()` reconstruía todo desde `State::new()` — perdiendo el
+/// mundo cargado en memoria y volviendo siempre al menú principal, que
+/// es justo lo que se pidió evitar. Con esto, en cambio, `resumed()`
+/// reconstruye el `State` a partir de estos datos ya en RAM (más rápido
+/// que releer todo de disco) y solo recrea lo que de verdad dependía de
+/// la superficie destruida: el dispositivo/superficie de wgpu y los
+/// buffers de GPU de cada chunk (`ChunkMesh`, que no se pueden guardar
+/// acá porque están atados al `wgpu::Device` viejo).
+struct SavedSession {
+    world_name: Option<String>,
+    chunks: HashMap<(i32, i32), environment::chunk::Chunk>,
+    seed: u32,
+    save_dir: std::path::PathBuf,
+    camera: Camera,
+    player: Player,
+    game_mode: GameMode,
+    selected_block: BlockType,
+    game_screen: GameScreen,
+    settings_return: GameScreen,
+    render_radius: i32,
+    show_fps: bool,
+    show_clouds: bool,
+    show_fog: bool,
+    show_build_info: bool,
+    show_debug_panel: bool,
+    autosave_interval_secs: u32,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     state: Option<State>,
@@ -1383,6 +1894,15 @@ struct App {
     // de "copiado" en vez del rojo normal (ver comentario de `flash` en
     // `State::render_crash_screen`). `None` = sin flash activo.
     crash_copy_flash_until: Option<Instant>,
+
+    // Snapshot en RAM de la partida, guardado por `suspended()` cuando
+    // Android destruye la superficie con una partida cargada, y
+    // consumido por el próximo `resumed()` (ver `SavedSession`). `None`
+    // en desktop (donde `suspended()` nunca llega) y también en Android
+    // mientras no haya ninguna partida en curso (menú principal/lista de
+    // mundos) — ahí no hace falta preservar nada, `State::new()` normal
+    // alcanza.
+    saved_session: Option<SavedSession>,
 }
 
 impl App {
@@ -1443,9 +1963,15 @@ impl ApplicationHandler for App {
             } else if self.state.is_none() {
                 // Android destruyó la superficie al pasar a segundo plano
                 // (ver `suspended()` más abajo) y ahora, al volver, nos avisa
-                // que hay una superficie nueva.
+                // que hay una superficie nueva. Si `suspended()` alcanzó a
+                // dejar un `SavedSession` (había una partida cargada),
+                // restauramos desde ahí en vez de arrancar de cero — así el
+                // mundo no se pierde ni hay que releerlo entero de disco.
                 let win = self.window.as_ref().unwrap();
-                self.state = Some(pollster::block_on(State::new(win.clone())));
+                self.state = Some(match self.saved_session.take() {
+                    Some(session) => pollster::block_on(State::resume(win.clone(), session)),
+                    None => pollster::block_on(State::new(win.clone())),
+                });
                 #[cfg(target_os = "android")]
                 immersive::apply_immersive_fullscreen();
             }
@@ -1458,11 +1984,21 @@ impl ApplicationHandler for App {
 
     // Solo llega en Android: la Activity puede pasar a segundo plano y el
     // sistema operativo destruir la superficie nativa en cualquier
-    // momento. Soltamos el `State` (que retiene el `wgpu::Surface`
-    // apuntando a esa superficie) para no quedar con un handle inválido;
-    // se reconstruye en el próximo `resumed()`.
+    // momento. Antes de soltar el `State` (que retiene el `wgpu::Surface`
+    // apuntando a esa superficie, ya inválida) guardamos a disco lo que
+    // esté sin guardar y, si había una partida cargada, armamos un
+    // `SavedSession` con todo lo que hace falta para restaurarla en
+    // `resumed()` sin perder progreso ni volver al menú principal.
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        self.state = None;
+        if let Some(mut state) = self.state.take() {
+            let saved = state.world.save_dirty_chunks();
+            if saved > 0 {
+                log::info!("Autoguardado antes de pasar a segundo plano: {} chunks.", saved);
+            }
+            if state.current_world_name.is_some() {
+                self.saved_session = Some(state.to_session());
+            }
+        }
     }
 
     fn window_event(
@@ -1591,12 +2127,58 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                 }
                 WindowEvent::Resized(physical_size) => state.resize(physical_size),
+                WindowEvent::CursorMoved { position, .. } => {
+                    state.cursor_pos = (position.x, position.y);
+                }
                 WindowEvent::MouseInput {
                     state: btn_state,
                     button,
                     ..
                 } => {
-                    if !state.mouse_captured {
+                    if state.game_screen != GameScreen::Playing {
+                        // En cualquier pantalla de menú: un click
+                        // izquierdo hace hit-test contra los botones de
+                        // esa pantalla en la última posición conocida del
+                        // cursor (ver `CursorMoved` arriba), en vez de
+                        // capturar el mouse o romper/colocar bloques —
+                        // eso solo pasa con el juego corriendo de verdad
+                        // (`GameScreen::Playing`).
+                        if btn_state == ElementState::Pressed && button == MouseButton::Left {
+                            let pos = state.cursor_pos;
+                            let size = state.render.size;
+                            let action = match state.game_screen {
+                                GameScreen::MainMenu => state.touch.on_click_main_menu(pos, size),
+                                GameScreen::WorldList => state.touch.on_click_worldlist(
+                                    pos,
+                                    size,
+                                    state.available_worlds.len(),
+                                ),
+                                GameScreen::Pause => state.touch.on_click_pause(pos, size),
+                                GameScreen::GameMode => state.touch.on_click_gamemode(pos, size),
+                                GameScreen::Settings => state.touch.on_click_settings(
+                                    pos,
+                                    size,
+                                    state.show_fps,
+                                    state.show_clouds,
+                                    state.show_fog,
+                                ),
+                                GameScreen::SettingsMore => state.touch.on_click_settings_more(
+                                    pos,
+                                    size,
+                                    state.show_build_info,
+                                    state.show_debug_panel,
+                                ),
+                                GameScreen::NameWorld => state.touch.on_click_nameworld(pos, size),
+                                GameScreen::ConfirmDeleteWorld => {
+                                    state.touch.on_click_confirmdelete(pos, size)
+                                }
+                                GameScreen::Playing => None,
+                            };
+                            if let Some(action) = action {
+                                state.apply_menu_action(action, event_loop, window);
+                            }
+                        }
+                    } else if !state.mouse_captured {
                         // El primer click solo captura el mouse (como en
                         // cualquier juego 3D en navegador/PC), no rompe ni
                         // coloca nada todavía.
@@ -1613,6 +2195,14 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::Touch(touch) => {
                     let action = match state.game_screen {
+                        GameScreen::MainMenu => {
+                            state.touch.on_touch_main_menu(touch, state.render.size)
+                        }
+                        GameScreen::WorldList => state.touch.on_touch_worldlist(
+                            touch,
+                            state.render.size,
+                            state.available_worlds.len(),
+                        ),
                         GameScreen::Pause => state.touch.on_touch_pause(touch, state.render.size),
                         GameScreen::GameMode => {
                             state.touch.on_touch_gamemode(touch, state.render.size)
@@ -1630,6 +2220,12 @@ impl ApplicationHandler for App {
                             state.show_build_info,
                             state.show_debug_panel,
                         ),
+                        GameScreen::NameWorld => {
+                            state.touch.on_touch_nameworld(touch, state.render.size)
+                        }
+                        GameScreen::ConfirmDeleteWorld => {
+                            state.touch.on_touch_confirmdelete(touch, state.render.size)
+                        }
                         GameScreen::Playing => {
                             // En juego: procesamos controles táctiles normales.
                             // Si el panel de debug está prendido, le pasamos
@@ -1650,82 +2246,71 @@ impl ApplicationHandler for App {
                         }
                     };
                     if let Some(action) = action {
-                        match action {
-                            TouchAction::Place => state.handle_click(MouseButton::Right),
-                            TouchAction::SelectBlock(n) => {
-                                state.selected_block = match n {
-                                    1 => BlockType::Grass,
-                                    2 => BlockType::Dirt,
-                                    3 => BlockType::Stone,
-                                    4 => BlockType::Wood,
-                                    _ => BlockType::Leaves,
-                                };
+                        state.apply_menu_action(action, event_loop, window);
+                    }
+                }
+                WindowEvent::Ime(ime_event) => {
+                    // El texto confirmado llega acá, del IME nativo del
+                    // sistema (Gboard/SwiftKey en Android, el teclado
+                    // del SO en desktop), habilitado solo mientras
+                    // `GameScreen::NameWorld` está en pantalla (ver el
+                    // toggle en `apply_menu_action`).
+                    if state.game_screen == GameScreen::NameWorld {
+                        match ime_event {
+                            winit::event::Ime::Preedit(text, _cursor_range) => {
+                                // Composición en curso (por ejemplo,
+                                // sílabas de un IME de predicción o CJK
+                                // que todavía no se confirmaron): se
+                                // guarda aparte y se muestra con otro
+                                // color en `build_nameworld_screen`, pero
+                                // OJO que todavía no cuenta como texto
+                                // del nombre — eso solo pasa con
+                                // `Ime::Commit`, más abajo. Así el
+                                // usuario puede seguir corrigiendo la
+                                // composición sin que cada tecla ya
+                                // quede pegada en `name_input`.
+                                state.name_preedit = text;
                             }
-                            TouchAction::OpenPause => {
-                                state.game_screen = GameScreen::Pause;
-                            }
-                            TouchAction::OpenGameModeScreen => {
-                                state.game_screen = GameScreen::GameMode;
-                            }
-                            TouchAction::OpenSettingsScreen => {
-                                state.game_screen = GameScreen::Settings;
-                            }
-                            TouchAction::OpenSettingsMore => {
-                                state.game_screen = GameScreen::SettingsMore;
-                            }
-                            TouchAction::ExitGame => {
-                                event_loop.exit();
-                            }
-                            TouchAction::Back => {
-                                // Sube un nivel en la jerarquía de menús
-                                // (ver comentario de `GameScreen`). Desde
-                                // Pause, "Volver" reanuda el juego.
-                                state.game_screen = match state.game_screen {
-                                    GameScreen::GameMode | GameScreen::Settings => GameScreen::Pause,
-                                    GameScreen::SettingsMore => GameScreen::Settings,
-                                    GameScreen::Pause | GameScreen::Playing => GameScreen::Playing,
-                                };
-                                if state.game_screen == GameScreen::Playing {
-                                    // Reiniciamos last_frame para no acumular
-                                    // un dt gigante después de la pausa.
-                                    state.last_frame = std::time::Instant::now();
+                            winit::event::Ime::Commit(text) => {
+                                state.name_preedit.clear();
+                                for c in text.chars() {
+                                    state.apply_menu_action(TouchAction::KeyboardChar(c), event_loop, window);
                                 }
                             }
-                            TouchAction::ToggleFps => {
-                                state.show_fps = !state.show_fps;
+                            winit::event::Ime::Disabled => {
+                                state.name_preedit.clear();
                             }
-                            TouchAction::SetGameMode(index) => {
-                                state.set_game_mode(GameMode::from_index(index));
-                            }
-                            TouchAction::DecreaseRenderRadius => {
-                                state.render_radius =
-                                    (state.render_radius - 1).max(MIN_RENDER_RADIUS);
-                            }
-                            TouchAction::IncreaseRenderRadius => {
-                                state.render_radius =
-                                    (state.render_radius + 1).min(MAX_RENDER_RADIUS);
-                            }
-                            TouchAction::ToggleClouds => {
-                                state.show_clouds = !state.show_clouds;
-                            }
-                            TouchAction::ToggleFog => {
-                                state.show_fog = !state.show_fog;
-                            }
-                            TouchAction::ToggleBuildInfo => {
-                                state.show_build_info = !state.show_build_info;
-                            }
-                            TouchAction::ToggleDebugPanel => {
-                                state.show_debug_panel = !state.show_debug_panel;
-                            }
-                            TouchAction::CopyDebugSnapshot => {
-                                state.copy_debug_snapshot();
-                            }
+                            winit::event::Ime::Enabled => {}
                         }
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
-                        if code == winit::keyboard::KeyCode::Escape
+                        if state.game_screen == GameScreen::NameWorld {
+                            // Con el IME ya puesto, del teclado físico
+                            // solo hacen falta las teclas de control que
+                            // el IME no manda como `Ime::Commit`: borrar,
+                            // confirmar y cancelar. Mientras esta
+                            // pantalla está abierta el resto del teclado
+                            // (cámara, F3, etc.) sigue deshabilitado a
+                            // propósito, para no mover al jugador
+                            // mientras tipea.
+                            if event.state == ElementState::Pressed {
+                                use winit::keyboard::KeyCode;
+                                match code {
+                                    KeyCode::Backspace => {
+                                        state.apply_menu_action(TouchAction::KeyboardBackspace, event_loop, window);
+                                    }
+                                    KeyCode::Enter | KeyCode::NumpadEnter => {
+                                        state.apply_menu_action(TouchAction::ConfirmNameWorld, event_loop, window);
+                                    }
+                                    KeyCode::Escape => {
+                                        state.apply_menu_action(TouchAction::Back, event_loop, window);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else if code == winit::keyboard::KeyCode::Escape
                             && event.state == ElementState::Pressed
                         {
                             if state.game_screen == GameScreen::Playing {
@@ -1734,13 +2319,33 @@ impl ApplicationHandler for App {
                                 state.mouse_captured = false;
                                 let _ = window.set_cursor_grab(CursorGrabMode::None);
                                 window.set_cursor_visible(true);
+                            } else if state.game_screen == GameScreen::MainMenu {
+                                // En el menú principal Esc no hace nada:
+                                // todavía no hay ninguna partida a la que
+                                // volver (a diferencia de Pause y las
+                                // pantallas que cuelgan de ella).
+                            } else if state.game_screen == GameScreen::WorldList {
+                                // Sin partida corriendo todavía: Esc solo
+                                // sube un nivel, a MainMenu (no a
+                                // "Playing" como en la rama general de
+                                // abajo).
+                                state.game_screen = GameScreen::MainMenu;
+                            } else if state.game_screen == GameScreen::Settings
+                                && state.settings_return == GameScreen::MainMenu
+                            {
+                                // Ajustes abiertos desde el menú
+                                // principal: Esc vuelve ahí, no a
+                                // "Playing" (todavía no hay partida
+                                // corriendo).
+                                state.game_screen = GameScreen::MainMenu;
                             } else {
-                                // Desde cualquier pantalla de menú, Esc
-                                // cierra todo de una y vuelve directo al
-                                // juego (a diferencia del botón táctil
-                                // "< VOLVER", que solo sube un nivel — en
-                                // desktop es más cómodo que Esc siempre
-                                // saque del menú del todo).
+                                // Desde cualquier pantalla de menú
+                                // colgando de Pause, Esc cierra todo de
+                                // una y vuelve directo al juego (a
+                                // diferencia del botón táctil "< VOLVER",
+                                // que solo sube un nivel — en desktop es
+                                // más cómodo que Esc siempre saque del
+                                // menú del todo).
                                 state.game_screen = GameScreen::Playing;
                                 state.last_frame = std::time::Instant::now();
                                 state.mouse_captured = true;

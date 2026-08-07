@@ -21,6 +21,8 @@ const HALF_WIDTH: f32 = 0.3;
 const HEIGHT: f32 = 1.8;
 const EYE_HEIGHT: f32 = 1.6;
 
+/// `Clone` para `SavedSession` (ver lib.rs), mismo motivo que en `Camera`.
+#[derive(Clone)]
 pub struct Player {
     /// Posición de los PIES del jugador (no de la cámara/ojos).
     pub feet_position: Vec3,
