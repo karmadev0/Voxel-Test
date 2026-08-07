@@ -21,6 +21,7 @@
 /// instalado, y por dentro hace las dos cosas — delega el formateo y la
 /// salida a stderr/logcat en el logger de plataforma que ya existía, y
 /// además escribe la misma línea a archivo.
+use log::Log;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
