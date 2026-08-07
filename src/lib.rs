@@ -45,13 +45,33 @@ use winit::{
 use winit::platform::android::activity::AndroidApp;
 
 /// Pantalla activa del juego. Controla qué se dibuja y si la lógica
-/// del juego (física, cámara) se actualiza o se pausa.
+/// del juego (física, cámara) se actualiza o se pausa. Cualquier
+/// variante distinta de `Playing` pausa el juego (ver `update`).
+///
+/// Jerarquía de menús (botón "< VOLVER" y Esc suben un nivel, ver
+/// `TouchAction::Back` y el manejo de Escape en `window_event`):
+///
+///   Playing
+///     └─ Pause              ("MODO DE JUEGO" / "AJUSTES" / "SALIR")
+///          ├─ GameMode      (selector Supervivencia/Creativo/Espectador)
+///          └─ Settings      (FPS, radio de chunks, nubes, niebla + botón
+///               │            "AJUSTES ADICIONALES")
+///               └─ SettingsMore  (info de build, panel de debug)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameScreen {
     /// Juego corriendo normalmente.
     Playing,
-    /// Configuración fullscreen: el juego queda pausado.
+    /// Menú de pausa (antes esto era la única pantalla de
+    /// "Configuración"): 3 botones — modo de juego, ajustes, salir.
+    Pause,
+    /// Selector de modo de juego, fullscreen, abierto desde Pause.
+    GameMode,
+    /// Ajustes de uso más frecuente (FPS, radio de chunks, nubes,
+    /// niebla), fullscreen, abierto desde Pause.
     Settings,
+    /// Ajustes menos frecuentes (info de build, panel de debug),
+    /// fullscreen, abierto desde Settings vía "AJUSTES ADICIONALES".
+    SettingsMore,
 }
 
 /// Modo de juego, igual que en Minecraft:
@@ -95,13 +115,24 @@ impl GameMode {
         !matches!(self, GameMode::Spectator)
     }
 
-    /// Si en este modo NO se puede colocar un bloque que se solape con
-    /// la propia caja de colisión del jugador (ver `handle_click`).
-    /// Solo Creative — Survival permite encerrarse (como Minecraft real,
-    /// hay que cavar para salir) y Spectator no tiene colisión, así que
-    /// la pregunta ni aplica.
+    /// Si en este modo NO se puede colocar un bloque sólido que se
+    /// solape con la propia caja de colisión del jugador (ver
+    /// `handle_click`). Ahora aplica a Survival Y Creative: colocar
+    /// bloque(s) sólido(s) encima de uno mismo mirando hacia abajo ya
+    /// no encierra al jugador sin salida — ese "encerrarse con dos
+    /// bloques y listo" era un exploit, no una mecánica deseada.
+    /// Espectador no tiene colisión, así que la pregunta ni aplica.
+    ///
+    /// Ojo: esto SOLO bloquea la colocación manual vía `handle_click`.
+    /// A propósito no toca nada relacionado con asfixia/ahogo por
+    /// bloques con gravedad (arena, agua) que puedan agregarse a
+    /// futuro — esos bloques van a caer sobre el jugador por su propia
+    /// simulación de física, no por esta ruta de "colocar con el
+    /// mouse/dedo", así que van a poder seguir atrapando/ahogando al
+    /// jugador como mecánica real del juego sin que este chequeo se
+    /// interponga.
     fn blocks_self_placement(self) -> bool {
-        matches!(self, GameMode::Creative)
+        !matches!(self, GameMode::Spectator)
     }
 
     /// Si en este modo aplica el auto-rescate al aire libre más cercano
@@ -267,8 +298,13 @@ struct State {
     // "tocar" algo un par de frames después). `None` = sin cooldown
     // activo, se puede rescatar de nuevo apenas haga falta.
     rescue_cooldown_until: Option<Instant>,
+    // Rescate en curso: posición de aire libre hacia la que se está
+    // arrastrando al jugador de a poco (ver `RESCUE_SPEED` y
+    // `step_rescue_drag`), en vez de teletransportarlo de un frame a
+    // otro. `None` = no hay rescate activo ahora mismo.
+    rescue_target: Option<glam::Vec3>,
 
-    /// Pantalla activa: Playing o Settings (pausa).
+    /// Pantalla activa (ver `GameScreen`).
     game_screen: GameScreen,
 }
 
@@ -342,6 +378,7 @@ impl State {
             show_debug_panel: false,
             debug_copy_flash_until: None,
             rescue_cooldown_until: None,
+            rescue_target: None,
             game_screen: GameScreen::Playing,
             current_player_chunk: (0, 0),
             render_radius: DEFAULT_RENDER_RADIUS,
@@ -404,16 +441,17 @@ impl State {
             }
             MouseButton::Right => {
                 let (x, y, z) = hit.place_pos;
-                // Solo en Creativo se impide construir donde está parado
-                // el jugador (evita quedar atrapado ahí mismo por
-                // accidente). En Supervivencia, como en Minecraft, SÍ se
-                // puede — si te encierras, tienes que cavar para salir;
-                // no hay red de seguridad. En Espectador la pregunta ni
-                // aplica: no hay colisión, nunca puede "encerrarte" a ti
-                // mismo.
+                // Se impide construir un bloque sólido donde está parado
+                // el jugador mismo (evita el exploit de encerrarse sin
+                // salida colocando bloques encima/delante mirando hacia
+                // abajo). Aplica en Supervivencia y Creativo por igual.
+                // En Espectador no hay colisión, así que la pregunta ni
+                // aplica. Ver el comentario en
+                // `GameMode::blocks_self_placement` sobre por qué esto
+                // no afecta a futuros bloques con gravedad (arena, agua).
                 if self.game_mode.blocks_self_placement() && self.player.occupies_block(x, y, z) {
                     log::info!(
-                        "Colocación de bloque bloqueada en ({}, {}, {}): se solapa con el jugador (modo Creativo).",
+                        "Colocación de bloque bloqueada en ({}, {}, {}): se solapa con el jugador.",
                         x, y, z
                     );
                     return;
@@ -455,13 +493,20 @@ impl State {
 
     /// Auto-rescate (paso 5, solo se llama cuando `game_mode.auto_rescue()`
     /// es true, hoy solo Creativo): si el jugador está atrapado dentro de
-    /// un sólido, lo teletransporta a la celda de aire libre más cercana.
+    /// un sólido, arranca un arrastre gradual hacia la celda de aire
+    /// libre más cercana (ver `RESCUE_SPEED`/`step_rescue_drag`) en vez
+    /// de teletransportarlo de golpe — se siente menos como un glitch.
     /// Tiene un pequeño cooldown para no intentar rescatar en cada frame
     /// mientras la física todavía se está asentando justo después de un
     /// rescate (por ejemplo, si el punto elegido resultó estar pegado a
     /// otro sólido y por redondeo el jugador vuelve a tocarlo un par de
     /// frames después).
     fn maybe_rescue_player(&mut self) {
+        // Ya hay un arrastre en curso: no hace falta buscar de nuevo,
+        // `step_rescue_drag` se encarga de terminarlo.
+        if self.rescue_target.is_some() {
+            return;
+        }
         if let Some(until) = self.rescue_cooldown_until {
             if Instant::now() < until {
                 return;
@@ -476,12 +521,12 @@ impl State {
         // generado encima) sin que la búsqueda se vuelva costosa. Si no
         // encuentra nada en ese radio (por ejemplo, enterrado en pleno
         // centro de una montaña sólida), no hacemos nada más que
-        // avisar por log — mejor eso que teletransportar a cualquier
-        // lado muy lejos de donde estaba el jugador.
+        // avisar por log — mejor eso que arrastrar al jugador a
+        // cualquier lado muy lejos de donde estaba.
         match self.player.find_nearest_free_position(&self.world, 8) {
             Some(free_pos) => {
                 log::info!(
-                    "Auto-rescate: jugador atrapado en ({:.1}, {:.1}, {:.1}), teletransportado a ({:.1}, {:.1}, {:.1}).",
+                    "Auto-rescate: jugador atrapado en ({:.1}, {:.1}, {:.1}), arrastrando hacia ({:.1}, {:.1}, {:.1}).",
                     self.player.feet_position.x,
                     self.player.feet_position.y,
                     self.player.feet_position.z,
@@ -489,10 +534,12 @@ impl State {
                     free_pos.y,
                     free_pos.z,
                 );
-                self.player.feet_position = free_pos;
+                self.rescue_target = Some(free_pos);
                 self.player.velocity = glam::Vec3::ZERO;
-                self.camera.position = self.player.eye_position();
-                self.rescue_cooldown_until = Some(Instant::now() + Duration::from_millis(500));
+                // El cooldown se aplica recién cuando el arrastre
+                // termina (`step_rescue_drag`), no acá — mientras
+                // `rescue_target` sea `Some` esta función ya vuelve
+                // apenas entra, así que no hace falta cooldown todavía.
             }
             None => {
                 log::warn!(
@@ -508,6 +555,40 @@ impl State {
                 self.rescue_cooldown_until = Some(Instant::now() + Duration::from_millis(500));
             }
         }
+    }
+
+    /// Avanza un frame del arrastre gradual hacia `target` (la celda de
+    /// aire libre elegida por `maybe_rescue_player`), a velocidad
+    /// constante `RESCUE_SPEED` bloques/segundo — así el rescate se
+    /// siente como que "tira" del jugador en vez de teletransportarlo.
+    /// Mientras el arrastre está activo, reemplaza por completo al
+    /// movimiento normal del modo de juego (ver el `match self.game_mode`
+    /// en `update`), para que la física normal no compita contra el
+    /// arrastre frame a frame.
+    fn step_rescue_drag(&mut self, target: glam::Vec3, dt: f32) {
+        const RESCUE_SPEED: f32 = 0.5; // bloques por segundo
+
+        let current = self.player.feet_position;
+        let delta = target - current;
+        let dist = delta.length();
+        let max_step = RESCUE_SPEED * dt;
+
+        if dist <= max_step || dist < 0.001 {
+            // Llegamos: dejamos al jugador exactamente en el punto
+            // elegido y cerramos el arrastre.
+            self.player.feet_position = target;
+            self.player.velocity = glam::Vec3::ZERO;
+            self.rescue_target = None;
+            self.rescue_cooldown_until = Some(Instant::now() + Duration::from_millis(500));
+            log::info!(
+                "Auto-rescate: jugador llegó a la posición segura ({:.1}, {:.1}, {:.1}).",
+                target.x, target.y, target.z
+            );
+        } else {
+            self.player.feet_position = current + delta / dist * max_step;
+        }
+
+        self.camera.position = self.player.eye_position();
     }
 
     /// Arma los datos del panel de debug (F3) a partir del estado actual
@@ -795,10 +876,11 @@ impl State {
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        // En pantalla de configuración: el juego queda pausado.
-        // Solo actualizamos el tiempo para no acumular un dt enorme
-        // al volver al juego.
-        if self.game_screen == GameScreen::Settings {
+        // En cualquier pantalla de menú (pausa, modo de juego, ajustes,
+        // ajustes adicionales): el juego queda pausado. Solo
+        // actualizamos el tiempo para no acumular un dt enorme al
+        // volver al juego.
+        if self.game_screen != GameScreen::Playing {
             return;
         }
 
@@ -818,40 +900,50 @@ impl State {
             self.handle_click(MouseButton::Left);
         }
 
-        match self.game_mode {
-            GameMode::Survival => {
-                if self.camera.wants_jump() {
-                    self.player.jump();
+        // Si hay un auto-rescate en curso, el arrastre gradual
+        // reemplaza por completo al movimiento normal de este frame —
+        // así no compite frame a frame contra la física/input del
+        // jugador mientras lo estamos "tirando" hacia la salida.
+        if let Some(target) = self.rescue_target {
+            self.step_rescue_drag(target, dt);
+        } else {
+            match self.game_mode {
+                GameMode::Survival => {
+                    if self.camera.wants_jump() {
+                        self.player.jump();
+                    }
+                    let horizontal = self.camera.horizontal_move_vector(4.5);
+                    self.player.update(&self.world, horizontal, dt);
+                    self.camera.position = self.player.eye_position();
                 }
-                let horizontal = self.camera.horizontal_move_vector(4.5);
-                self.player.update(&self.world, horizontal, dt);
-                self.camera.position = self.player.eye_position();
+                GameMode::Creative => {
+                    // Vuelo con colisión: no atraviesa bloques, pero sin
+                    // gravedad ni salto — subir/bajar es directo con
+                    // Espacio/Shift (ver Camera::free_move_vector).
+                    let free_move = self.camera.free_move_vector(8.0);
+                    self.player.fly_update(&self.world, free_move, dt);
+                    self.camera.position = self.player.eye_position();
+                }
+                GameMode::Spectator => {
+                    // Noclip: la cámara se mueve directo, sin pasar por
+                    // Player ni chequear colisión contra el mundo.
+                    self.camera.update(dt);
+                }
             }
-            GameMode::Creative => {
-                // Vuelo con colisión: no atraviesa bloques, pero sin
-                // gravedad ni salto — subir/bajar es directo con
-                // Espacio/Shift (ver Camera::free_move_vector).
-                let free_move = self.camera.free_move_vector(8.0);
-                self.player.fly_update(&self.world, free_move, dt);
-                self.camera.position = self.player.eye_position();
-            }
-            GameMode::Spectator => {
-                // Noclip: la cámara se mueve directo, sin pasar por
-                // Player ni chequear colisión contra el mundo.
-                self.camera.update(dt);
-            }
-        }
 
-        // Auto-rescate (solo Creativo, ver GameMode::auto_rescue): si el
-        // jugador quedó atrapado dentro de un sólido — por streaming de
-        // chunks, un bug, o al cargar un guardado viejo de antes del
-        // bloqueo de autoconstrucción — lo teletransporta a la celda de
-        // aire libre más cercana. En Supervivencia esto NO se ejecuta a
-        // propósito: como en Minecraft real, si te encierras tienes que
-        // cavar para salir. En Espectador no aplica porque sin colisión
-        // nunca se puede quedar "atrapado".
-        if self.game_mode.auto_rescue() {
-            self.maybe_rescue_player();
+            // Auto-rescate (solo Creativo, ver GameMode::auto_rescue): si
+            // el jugador quedó atrapado dentro de un sólido — por
+            // streaming de chunks, un bug, o al cargar un guardado viejo
+            // de antes del bloqueo de autoconstrucción — arranca un
+            // arrastre gradual hacia la celda de aire libre más cercana
+            // (ver `step_rescue_drag`, arriba). En Supervivencia esto NO
+            // se ejecuta a propósito: como en Minecraft real, si te
+            // encierras tienes que cavar para salir. En Espectador no
+            // aplica porque sin colisión nunca se puede quedar
+            // "atrapado".
+            if self.game_mode.auto_rescue() {
+                self.maybe_rescue_player();
+            }
         }
 
         let aspect = self.render.config.width as f32 / self.render.config.height.max(1) as f32;
@@ -912,64 +1004,72 @@ impl State {
             });
 
         // Geometría del overlay 2D de este frame.
-        // En pantalla de configuración: mostramos la pantalla fullscreen de
-        // ajustes encima del mundo congelado. En juego: mira + controles.
-        let ui_vertices = if self.game_screen == GameScreen::Settings {
-            ui_overlay::build_settings_screen(
+        // En cualquier pantalla de menú: mostramos esa pantalla
+        // fullscreen encima del mundo congelado. En juego: mira +
+        // controles.
+        let ui_vertices = match self.game_screen {
+            GameScreen::Pause => ui_overlay::build_pause_screen(self.render.size),
+            GameScreen::GameMode => {
+                ui_overlay::build_gamemode_screen(self.render.size, self.game_mode.index())
+            }
+            GameScreen::Settings => ui_overlay::build_settings_screen(
                 self.render.size,
                 self.show_fps,
-                self.game_mode.index(),
                 self.render_radius,
                 self.show_clouds,
                 self.show_fog,
+            ),
+            GameScreen::SettingsMore => ui_overlay::build_settings_more_screen(
+                self.render.size,
                 self.show_build_info,
                 self.show_debug_panel,
-            )
-        } else {
-            let mut verts = ui_overlay::build_crosshair(self.render.size);
-            #[cfg(target_os = "android")]
-            verts.extend(ui_overlay::build_touch_overlay(
-                &self.touch,
-                self.render.size,
-                self.selected_block,
-                self.show_fps,
-            ));
-            // Contador de FPS en la esquina superior derecha.
-            if self.show_fps {
-                verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.render.size));
-            }
-            // Info de build (etiqueta + plataforma) en la esquina
-            // superior izquierda. `VOXEL_BUILD_TAG` se fija en
-            // compilación (ver build.rs); por defecto es
-            // "voxel-engine-dev" si no se pasó `BUILD_TAG=...`.
-            if self.show_build_info {
-                verts.extend(ui_overlay::build_build_info_overlay(
+            ),
+            GameScreen::Playing => {
+                let mut verts = ui_overlay::build_crosshair(self.render.size);
+                #[cfg(target_os = "android")]
+                verts.extend(ui_overlay::build_touch_overlay(
+                    &self.touch,
                     self.render.size,
-                    env!("VOXEL_BUILD_TAG"),
+                    self.selected_block,
+                    self.show_fps,
                 ));
+                // Contador de FPS en la esquina superior derecha.
+                if self.show_fps {
+                    verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.render.size));
+                }
+                // Info de build (etiqueta + plataforma) en la esquina
+                // superior izquierda. `VOXEL_BUILD_TAG` se fija en
+                // compilación (ver build.rs); por defecto es
+                // "voxel-engine-dev" si no se pasó `BUILD_TAG=...`.
+                if self.show_build_info {
+                    verts.extend(ui_overlay::build_build_info_overlay(
+                        self.render.size,
+                        env!("VOXEL_BUILD_TAG"),
+                    ));
+                }
+                // Panel de debug (F3): posición, chunk, bloque apuntado,
+                // modo, fps, ruta de log. Se dibuja debajo del overlay de
+                // build info si ambos están prendidos, para no superponerse.
+                if self.show_debug_panel {
+                    let y_offset = if self.show_build_info {
+                        ui_overlay::build_info_overlay_height()
+                    } else {
+                        0.0
+                    };
+                    let copy_flash = self
+                        .debug_copy_flash_until
+                        .map(|until| Instant::now() < until)
+                        .unwrap_or(false);
+                    let data = self.build_debug_panel_data();
+                    verts.extend(ui_overlay::build_debug_panel(
+                        self.render.size,
+                        &data,
+                        y_offset,
+                        copy_flash,
+                    ));
+                }
+                verts
             }
-            // Panel de debug (F3): posición, chunk, bloque apuntado,
-            // modo, fps, ruta de log. Se dibuja debajo del overlay de
-            // build info si ambos están prendidos, para no superponerse.
-            if self.show_debug_panel {
-                let y_offset = if self.show_build_info {
-                    ui_overlay::build_info_overlay_height()
-                } else {
-                    0.0
-                };
-                let copy_flash = self
-                    .debug_copy_flash_until
-                    .map(|until| Instant::now() < until)
-                    .unwrap_or(false);
-                let data = self.build_debug_panel_data();
-                verts.extend(ui_overlay::build_debug_panel(
-                    self.render.size,
-                    &data,
-                    y_offset,
-                    copy_flash,
-                ));
-            }
-            verts
         };
         let ui_vertex_buffer = self
             .render
@@ -1501,36 +1601,42 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::Touch(touch) => {
-                    let action = if state.game_screen == GameScreen::Settings {
-                        // En pantalla de configuración: procesamos toques
-                        // del menú de ajustes solamente.
-                        state.touch.on_touch_settings(
+                    let action = match state.game_screen {
+                        GameScreen::Pause => state.touch.on_touch_pause(touch, state.render.size),
+                        GameScreen::GameMode => {
+                            state.touch.on_touch_gamemode(touch, state.render.size)
+                        }
+                        GameScreen::Settings => state.touch.on_touch_settings(
                             touch,
                             state.render.size,
                             state.show_fps,
-                            state.game_mode.index(),
                             state.show_clouds,
                             state.show_fog,
+                        ),
+                        GameScreen::SettingsMore => state.touch.on_touch_settings_more(
+                            touch,
+                            state.render.size,
                             state.show_build_info,
                             state.show_debug_panel,
-                        )
-                    } else {
-                        // En juego: procesamos controles táctiles normales.
-                        // Si el panel de debug está prendido, le pasamos
-                        // el rect de su botón "COPIAR" para que
-                        // on_touch_game lo detecte antes que cualquier
-                        // otra zona táctil (joystick, mira, etc.).
-                        let copy_rect = if state.show_debug_panel {
-                            let y_offset = if state.show_build_info {
-                                ui_overlay::build_info_overlay_height()
+                        ),
+                        GameScreen::Playing => {
+                            // En juego: procesamos controles táctiles normales.
+                            // Si el panel de debug está prendido, le pasamos
+                            // el rect de su botón "COPIAR" para que
+                            // on_touch_game lo detecte antes que cualquier
+                            // otra zona táctil (joystick, mira, etc.).
+                            let copy_rect = if state.show_debug_panel {
+                                let y_offset = if state.show_build_info {
+                                    ui_overlay::build_info_overlay_height()
+                                } else {
+                                    0.0
+                                };
+                                Some(ui_overlay::rect_debug_panel_copy_button(state.render.size, y_offset))
                             } else {
-                                0.0
+                                None
                             };
-                            Some(ui_overlay::rect_debug_panel_copy_button(state.render.size, y_offset))
-                        } else {
-                            None
-                        };
-                        state.touch.on_touch_game(touch, state.render.size, copy_rect)
+                            state.touch.on_touch_game(touch, state.render.size, copy_rect)
+                        }
                     };
                     if let Some(action) = action {
                         match action {
@@ -1542,14 +1648,35 @@ impl ApplicationHandler for App {
                                     _ => BlockType::Stone,
                                 };
                             }
-                            TouchAction::OpenSettings => {
+                            TouchAction::OpenPause => {
+                                state.game_screen = GameScreen::Pause;
+                            }
+                            TouchAction::OpenGameModeScreen => {
+                                state.game_screen = GameScreen::GameMode;
+                            }
+                            TouchAction::OpenSettingsScreen => {
                                 state.game_screen = GameScreen::Settings;
                             }
-                            TouchAction::CloseSettings => {
-                                state.game_screen = GameScreen::Playing;
-                                // Reiniciamos last_frame para no acumular
-                                // un dt gigante después de la pausa.
-                                state.last_frame = std::time::Instant::now();
+                            TouchAction::OpenSettingsMore => {
+                                state.game_screen = GameScreen::SettingsMore;
+                            }
+                            TouchAction::ExitGame => {
+                                event_loop.exit();
+                            }
+                            TouchAction::Back => {
+                                // Sube un nivel en la jerarquía de menús
+                                // (ver comentario de `GameScreen`). Desde
+                                // Pause, "Volver" reanuda el juego.
+                                state.game_screen = match state.game_screen {
+                                    GameScreen::GameMode | GameScreen::Settings => GameScreen::Pause,
+                                    GameScreen::SettingsMore => GameScreen::Settings,
+                                    GameScreen::Pause | GameScreen::Playing => GameScreen::Playing,
+                                };
+                                if state.game_screen == GameScreen::Playing {
+                                    // Reiniciamos last_frame para no acumular
+                                    // un dt gigante después de la pausa.
+                                    state.last_frame = std::time::Instant::now();
+                                }
                             }
                             TouchAction::ToggleFps => {
                                 state.show_fps = !state.show_fps;
@@ -1588,20 +1715,25 @@ impl ApplicationHandler for App {
                         if code == winit::keyboard::KeyCode::Escape
                             && event.state == ElementState::Pressed
                         {
-                            if state.game_screen == GameScreen::Settings {
-                                // Cerrar configuración y volver al juego.
+                            if state.game_screen == GameScreen::Playing {
+                                // Abrir el menú de pausa.
+                                state.game_screen = GameScreen::Pause;
+                                state.mouse_captured = false;
+                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                window.set_cursor_visible(true);
+                            } else {
+                                // Desde cualquier pantalla de menú, Esc
+                                // cierra todo de una y vuelve directo al
+                                // juego (a diferencia del botón táctil
+                                // "< VOLVER", que solo sube un nivel — en
+                                // desktop es más cómodo que Esc siempre
+                                // saque del menú del todo).
                                 state.game_screen = GameScreen::Playing;
                                 state.last_frame = std::time::Instant::now();
                                 state.mouse_captured = true;
                                 let _ = window.set_cursor_grab(CursorGrabMode::Confined)
                                     .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
                                 window.set_cursor_visible(false);
-                            } else {
-                                // Abrir configuración (pausa).
-                                state.game_screen = GameScreen::Settings;
-                                state.mouse_captured = false;
-                                let _ = window.set_cursor_grab(CursorGrabMode::None);
-                                window.set_cursor_visible(true);
                             }
                         } else if event.state == ElementState::Pressed
                             && code == winit::keyboard::KeyCode::F5

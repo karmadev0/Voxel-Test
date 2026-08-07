@@ -647,67 +647,150 @@ pub fn build_touch_overlay(
 
 /// Construye toda la geometría de la pantalla de configuración.
 /// Se dibuja encima del frame del juego (que queda congelado).
-pub fn build_settings_screen(
+/// Fondo semitransparente oscuro + panel central con borde, compartido
+/// por las 4 pantallas de menú (Pause, GameMode, Settings,
+/// SettingsMore) para que todas tengan el mismo look. Devuelve
+/// `(panel_x, panel_y, panel_w, panel_h)` para que el llamador siga
+/// dibujando contenido adentro.
+fn push_menu_panel_background(
+    v: &mut Vec<UiVertex>,
     size: PhysicalSize<u32>,
-    show_fps: bool,
-    game_mode_index: usize,
-    render_radius: i32,
-    show_clouds: bool,
-    show_fog: bool,
-    show_build_info: bool,
-    show_debug_panel: bool,
-) -> Vec<UiVertex> {
-    let mut v = Vec::with_capacity(512);
+) -> (f64, f64, f64, f64) {
     let sw = size.width as f64;
     let sh = size.height as f64;
     let cx = sw * 0.5;
 
-    // --- Fondo semitransparente oscuro sobre el mundo pausado ---
-    push_quad(&mut v, size, (0.0, 0.0, sw, sh), [0.0, 0.0, 0.0, 0.72]);
+    push_quad(v, size, (0.0, 0.0, sw, sh), [0.0, 0.0, 0.0, 0.72]);
 
-    // --- Panel central ---
     let panel_w = 520.0_f64.min(sw * 0.85);
     let panel_h = sh * 0.78;
     let panel_x = cx - panel_w * 0.5;
     let panel_y = sh * 0.14;
-    // Fondo del panel con borde sutil.
-    push_quad(&mut v, size, (panel_x - 3.0, panel_y - 3.0, panel_w + 6.0, panel_h + 6.0), [0.4, 0.55, 0.9, 0.35]);
-    push_quad(&mut v, size, (panel_x, panel_y, panel_w, panel_h), [0.05, 0.06, 0.10, 0.93]);
+    push_quad(v, size, (panel_x - 3.0, panel_y - 3.0, panel_w + 6.0, panel_h + 6.0), [0.4, 0.55, 0.9, 0.35]);
+    push_quad(v, size, (panel_x, panel_y, panel_w, panel_h), [0.05, 0.06, 0.10, 0.93]);
 
-    // --- Título: "CONFIGURACION" en fuente grande ---
-    let title = "CONFIGURACION";
+    (panel_x, panel_y, panel_w, panel_h)
+}
+
+/// Título grande centrado + línea separadora debajo, común a las 4
+/// pantallas de menú. Devuelve la Y donde termina el separador, para
+/// que el contenido que sigue no se le superponga.
+fn push_menu_title(
+    v: &mut Vec<UiVertex>,
+    size: PhysicalSize<u32>,
+    panel: (f64, f64, f64, f64),
+    title: &str,
+) -> f64 {
+    let (panel_x, panel_y, panel_w, _) = panel;
+    let cx = size.width as f64 * 0.5;
     let title_y = panel_y + 22.0;
-    push_text_large_centered(&mut v, size, title, cx, title_y, [0.9, 0.95, 1.0, 1.0]);
-
-    // Línea separadora bajo el título.
+    push_text_large_centered(v, size, title, cx, title_y, [0.9, 0.95, 1.0, 1.0]);
     let sep_y = title_y + FONT_LARGE_CELL_H + 16.0;
-    push_quad(&mut v, size, (panel_x + 20.0, sep_y, panel_w - 40.0, 2.0), [0.4, 0.55, 0.9, 0.5]);
+    push_quad(v, size, (panel_x + 20.0, sep_y, panel_w - 40.0, 2.0), [0.4, 0.55, 0.9, 0.5]);
+    sep_y
+}
 
-    // --- Fila 1: "MOSTRAR FPS" con toggle ---
-    let row1 = TouchController::rect_settings_fps_row(size);
-    let label1_y = row1.1 + (row1.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "MOSTRAR FPS", row1.0, label1_y, [0.85, 0.88, 0.95, 1.0]);
-    let switch1 = TouchController::rect_row_switch(row1);
-    push_toggle_switch(&mut v, size, switch1, show_fps);
-    // Etiqueta de estado ON/OFF.
-    let state1 = if show_fps { "ON" } else { "OFF" };
-    let state_color1: [f32; 4] = if show_fps { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    let state1_x = switch1.0 - text_width(state1) - 12.0;
-    push_text(&mut v, size, state1, state1_x, label1_y, state_color1);
+/// Botón "< VOLVER" arriba a la izquierda, común a las 4 pantallas de
+/// menú (sube un nivel en la jerarquía, ver `TouchAction::Back`).
+fn push_back_button(v: &mut Vec<UiVertex>, size: PhysicalSize<u32>) {
+    let back_rect = TouchController::rect_back_button(size);
+    push_quad(v, size, (back_rect.0 - 2.0, back_rect.1 - 2.0, back_rect.2 + 4.0, back_rect.3 + 4.0), [0.3, 0.5, 0.85, 0.4]);
+    push_quad(v, size, back_rect, [0.12, 0.18, 0.32, 0.90]);
+    let back_label = "< VOLVER";
+    let back_lx = back_rect.0 + (back_rect.2 - text_width(back_label)) * 0.5;
+    let back_ly = back_rect.1 + (back_rect.3 - FONT_CELL_H) * 0.5;
+    push_text(v, size, back_label, back_lx, back_ly, [0.8, 0.88, 1.0, 1.0]);
+}
 
-    // Separador entre filas.
-    push_quad(&mut v, size, (row1.0, row1.1 + row1.3 + 4.0, row1.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+/// Nota "JUEGO PAUSADO" en la esquina inferior del panel, común a las 4
+/// pantallas de menú (todas pausan el juego, ver `GameScreen`/`update`).
+fn push_pause_note(v: &mut Vec<UiVertex>, size: PhysicalSize<u32>, panel: (f64, f64, f64, f64)) {
+    let (_, panel_y, _, panel_h) = panel;
+    let cx = size.width as f64 * 0.5;
+    let pause_text = "JUEGO PAUSADO";
+    let pause_y = panel_y + panel_h - FONT_CELL_H - 18.0;
+    push_text_centered(v, size, pause_text, cx, pause_y, [0.5, 0.55, 0.65, 0.7]);
+}
 
-    // --- Fila 2: "MODO DE JUEGO" — selector de 3 opciones ---
-    // A diferencia de las demás filas (un simple switch ON/OFF), acá hay
-    // una etiqueta propia arriba y 3 sub-botones lado a lado debajo:
-    // Supervivencia / Creativo / Espectador. El que coincide con
-    // `game_mode_index` se dibuja resaltado. `rect_settings_walk_row` ya
-    // viene con espacio extra reservado arriba para esta etiqueta (ver
-    // touch.rs) — no se superpone con la fila anterior.
-    let row2 = TouchController::rect_settings_walk_row(size);
-    let label2_y = row2.1 - FONT_CELL_H - 6.0;
-    push_text(&mut v, size, "MODO DE JUEGO", row2.0, label2_y, [0.85, 0.88, 0.95, 1.0]);
+/// Dibuja un botón grande de una sola línea (usado por el menú de pausa
+/// y por "AJUSTES ADICIONALES"), con su fondo y etiqueta centrada.
+fn push_big_button(
+    v: &mut Vec<UiVertex>,
+    size: PhysicalSize<u32>,
+    rect: (f64, f64, f64, f64),
+    label: &str,
+    bg: [f32; 4],
+    text_color: [f32; 4],
+) {
+    push_quad(v, size, rect, bg);
+    let (rx, ry, rw, rh) = rect;
+    let lx = rx + (rw - text_width(label)) * 0.5;
+    let ly = ry + (rh - FONT_CELL_H) * 0.5;
+    push_text(v, size, label, lx, ly, text_color);
+}
+
+/// Dibuja una fila de ajuste ON/OFF completa: etiqueta a la izquierda +
+/// switch visual + texto de estado a la derecha, más el separador
+/// debajo. Reutilizado por las filas "MOSTRAR FPS", "NUBES", "NIEBLA",
+/// "INFO DE BUILD" y "PANEL DE DEBUG (F3)".
+fn push_toggle_row(
+    v: &mut Vec<UiVertex>,
+    size: PhysicalSize<u32>,
+    row: (f64, f64, f64, f64),
+    label: &str,
+    is_on: bool,
+) {
+    let label_y = row.1 + (row.3 - FONT_CELL_H) * 0.5;
+    push_text(v, size, label, row.0, label_y, [0.85, 0.88, 0.95, 1.0]);
+    let switch = TouchController::rect_row_switch(row);
+    push_toggle_switch(v, size, switch, is_on);
+    let state = if is_on { "ON" } else { "OFF" };
+    let state_color: [f32; 4] = if is_on { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
+    let state_x = switch.0 - text_width(state) - 12.0;
+    push_text(v, size, state, state_x, label_y, state_color);
+    push_quad(v, size, (row.0, row.1 + row.3 + 4.0, row.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+}
+
+/// Pantalla de pausa (Playing -> Pause): el menú raíz al que se llega
+/// desde el botón de engranaje / tecla Esc. 3 botones grandes: "MODO DE
+/// JUEGO", "AJUSTES" y "SALIR". Ya no muestra ningún control en sí —
+/// esos viven en las pantallas a las que llevan estos botones (ver
+/// `build_gamemode_screen`/`build_settings_screen`).
+pub fn build_pause_screen(size: PhysicalSize<u32>) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(256);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "PAUSA");
+
+    const LABELS: [&str; 3] = ["MODO DE JUEGO", "AJUSTES", "SALIR"];
+    const COLORS: [[f32; 4]; 3] = [
+        [0.15, 0.2, 0.32, 0.9],
+        [0.15, 0.2, 0.32, 0.9],
+        [0.32, 0.14, 0.16, 0.9],
+    ];
+    const TEXT_COLORS: [[f32; 4]; 3] = [
+        [0.85, 0.9, 1.0, 1.0],
+        [0.85, 0.9, 1.0, 1.0],
+        [1.0, 0.75, 0.72, 1.0],
+    ];
+    for i in 0..3 {
+        let rect = TouchController::rect_pause_button(size, i);
+        push_big_button(&mut v, size, rect, LABELS[i], COLORS[i], TEXT_COLORS[i]);
+    }
+
+    push_back_button(&mut v, size);
+    push_pause_note(&mut v, size, panel);
+    v
+}
+
+/// Pantalla de selector de modo de juego (Pause -> GameMode).
+pub fn build_gamemode_screen(size: PhysicalSize<u32>, game_mode_index: usize) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(256);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "MODO DE JUEGO");
+
+    let row = TouchController::rect_gamemode_row(size);
+    let label_y = row.1 - FONT_CELL_H - 10.0;
+    push_text_centered(&mut v, size, "ELEGI COMO QUERES JUGAR", size.width as f64 * 0.5, label_y, [0.7, 0.75, 0.85, 1.0]);
 
     const MODE_LABELS: [&str; 3] = ["SUPERVIV.", "CREATIVO", "ESPECT."];
     for i in 0..3 {
@@ -723,15 +806,37 @@ pub fn build_settings_screen(
         push_text(&mut v, size, label, lx, ly, text_color);
     }
 
-    push_quad(&mut v, size, (row2.0, row2.1 + row2.3 + 4.0, row2.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+    push_back_button(&mut v, size);
+    push_pause_note(&mut v, size, panel);
+    v
+}
 
-    // --- Fila 3: "DISTANCIA DE CHUNKS" con stepper [-] valor [+] ---
-    let row3 = TouchController::rect_settings_render_distance_row(size);
-    let label3_y = row3.1 + (row3.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "RADIO DE CHUNKS", row3.0, label3_y, [0.85, 0.88, 0.95, 1.0]);
+/// Pantalla de ajustes principales (Pause -> Settings): los controles
+/// que se tocan más seguido — FPS, radio de chunks, nubes, niebla —
+/// más el botón "AJUSTES ADICIONALES" que lleva al resto (ver
+/// `build_settings_more_screen`).
+pub fn build_settings_screen(
+    size: PhysicalSize<u32>,
+    show_fps: bool,
+    render_radius: i32,
+    show_clouds: bool,
+    show_fog: bool,
+) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(512);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "AJUSTES");
 
-    let minus_rect = TouchController::rect_stepper_minus(row3);
-    let plus_rect = TouchController::rect_stepper_plus(row3);
+    // --- "MOSTRAR FPS" ---
+    let row1 = TouchController::rect_settings_fps_row(size);
+    push_toggle_row(&mut v, size, row1, "MOSTRAR FPS", show_fps);
+
+    // --- "RADIO DE CHUNKS" con stepper [-] valor [+] ---
+    let row2 = TouchController::rect_settings_render_distance_row(size);
+    let label2_y = row2.1 + (row2.3 - FONT_CELL_H) * 0.5;
+    push_text(&mut v, size, "RADIO DE CHUNKS", row2.0, label2_y, [0.85, 0.88, 0.95, 1.0]);
+
+    let minus_rect = TouchController::rect_stepper_minus(row2);
+    let plus_rect = TouchController::rect_stepper_plus(row2);
     push_quad(&mut v, size, minus_rect, [0.18, 0.22, 0.32, 0.9]);
     push_quad(&mut v, size, plus_rect, [0.18, 0.22, 0.32, 0.9]);
     let minus_label = "-";
@@ -743,81 +848,48 @@ pub fn build_settings_screen(
     let plus_ly = plus_rect.1 + (plus_rect.3 - FONT_CELL_H) * 0.5;
     push_text(&mut v, size, plus_label, plus_lx, plus_ly, [0.85, 0.9, 1.0, 1.0]);
 
-    // Valor numérico, centrado entre los dos botones.
     let value_text = render_radius.to_string();
     let value_cx = (minus_rect.0 + minus_rect.2 + plus_rect.0) * 0.5;
     let value_lx = value_cx - text_width(&value_text) * 0.5;
-    push_text(&mut v, size, &value_text, value_lx, label3_y, [1.0, 0.85, 0.4, 1.0]);
+    push_text(&mut v, size, &value_text, value_lx, label2_y, [1.0, 0.85, 0.4, 1.0]);
 
-    push_quad(&mut v, size, (row3.0, row3.1 + row3.3 + 4.0, row3.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+    push_quad(&mut v, size, (row2.0, row2.1 + row2.3 + 4.0, row2.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
 
-    // --- Fila 4: "NUBES" con toggle ---
-    let row4 = TouchController::rect_settings_clouds_row(size);
-    let label4_y = row4.1 + (row4.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "NUBES", row4.0, label4_y, [0.85, 0.88, 0.95, 1.0]);
-    let switch4 = TouchController::rect_row_switch(row4);
-    push_toggle_switch(&mut v, size, switch4, show_clouds);
-    let state4 = if show_clouds { "ON" } else { "OFF" };
-    let state_color4: [f32; 4] = if show_clouds { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    let state4_x = switch4.0 - text_width(state4) - 12.0;
-    push_text(&mut v, size, state4, state4_x, label4_y, state_color4);
+    // --- "NUBES" ---
+    let row3 = TouchController::rect_settings_clouds_row(size);
+    push_toggle_row(&mut v, size, row3, "NUBES", show_clouds);
 
-    push_quad(&mut v, size, (row4.0, row4.1 + row4.3 + 4.0, row4.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+    // --- "NIEBLA" ---
+    let row4 = TouchController::rect_settings_fog_row(size);
+    push_toggle_row(&mut v, size, row4, "NIEBLA", show_fog);
 
-    // --- Fila 5: "NIEBLA" con toggle ---
-    let row5 = TouchController::rect_settings_fog_row(size);
-    let label5_y = row5.1 + (row5.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "NIEBLA", row5.0, label5_y, [0.85, 0.88, 0.95, 1.0]);
-    let switch5 = TouchController::rect_row_switch(row5);
-    push_toggle_switch(&mut v, size, switch5, show_fog);
-    let state5 = if show_fog { "ON" } else { "OFF" };
-    let state_color5: [f32; 4] = if show_fog { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    let state5_x = switch5.0 - text_width(state5) - 12.0;
-    push_text(&mut v, size, state5, state5_x, label5_y, state_color5);
+    // --- Botón "AJUSTES ADICIONALES" ---
+    let more_rect = TouchController::rect_settings_more_button(size);
+    push_big_button(&mut v, size, more_rect, "AJUSTES ADICIONALES", [0.16, 0.22, 0.34, 0.9], [0.8, 0.88, 1.0, 1.0]);
 
-    push_quad(&mut v, size, (row5.0, row5.1 + row5.3 + 4.0, row5.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+    push_back_button(&mut v, size);
+    push_pause_note(&mut v, size, panel);
+    v
+}
 
-    // --- Fila 6: "INFO DE BUILD" con toggle ---
-    let row6 = TouchController::rect_settings_build_info_row(size);
-    let label6_y = row6.1 + (row6.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "INFO DE BUILD", row6.0, label6_y, [0.85, 0.88, 0.95, 1.0]);
-    let switch6 = TouchController::rect_row_switch(row6);
-    push_toggle_switch(&mut v, size, switch6, show_build_info);
-    let state6 = if show_build_info { "ON" } else { "OFF" };
-    let state_color6: [f32; 4] = if show_build_info { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    let state6_x = switch6.0 - text_width(state6) - 12.0;
-    push_text(&mut v, size, state6, state6_x, label6_y, state_color6);
+/// Pantalla de ajustes adicionales (Settings -> SettingsMore): controles
+/// que se tocan con menos frecuencia — info de build y panel de debug.
+pub fn build_settings_more_screen(
+    size: PhysicalSize<u32>,
+    show_build_info: bool,
+    show_debug_panel: bool,
+) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(512);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "AJUSTES ADICIONALES");
 
-    push_quad(&mut v, size, (row6.0, row6.1 + row6.3 + 4.0, row6.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
+    let row1 = TouchController::rect_settings_build_info_row(size);
+    push_toggle_row(&mut v, size, row1, "INFO DE BUILD", show_build_info);
 
-    // --- Fila 7: "PANEL DE DEBUG" con toggle ---
-    let row7 = TouchController::rect_settings_debug_panel_row(size);
-    let label7_y = row7.1 + (row7.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, "PANEL DE DEBUG (F3)", row7.0, label7_y, [0.85, 0.88, 0.95, 1.0]);
-    let switch7 = TouchController::rect_row_switch(row7);
-    push_toggle_switch(&mut v, size, switch7, show_debug_panel);
-    let state7 = if show_debug_panel { "ON" } else { "OFF" };
-    let state_color7: [f32; 4] = if show_debug_panel { [0.3, 0.9, 0.4, 1.0] } else { [0.6, 0.6, 0.6, 1.0] };
-    let state7_x = switch7.0 - text_width(state7) - 12.0;
-    push_text(&mut v, size, state7, state7_x, label7_y, state_color7);
+    let row2 = TouchController::rect_settings_debug_panel_row(size);
+    push_toggle_row(&mut v, size, row2, "PANEL DE DEBUG (F3)", show_debug_panel);
 
-    push_quad(&mut v, size, (row7.0, row7.1 + row7.3 + 4.0, row7.2, 1.0), [0.3, 0.3, 0.4, 0.4]);
-
-    // --- Botón "< VOLVER" arriba izquierda ---
-    let back_rect = TouchController::rect_back_button(size);
-    // Fondo del botón con hover glow.
-    push_quad(&mut v, size, (back_rect.0 - 2.0, back_rect.1 - 2.0, back_rect.2 + 4.0, back_rect.3 + 4.0), [0.3, 0.5, 0.85, 0.4]);
-    push_quad(&mut v, size, back_rect, [0.12, 0.18, 0.32, 0.90]);
-    // Texto "< VOLVER" centrado en el botón.
-    let back_label = "< VOLVER";
-    let back_lx = back_rect.0 + (back_rect.2 - text_width(back_label)) * 0.5;
-    let back_ly = back_rect.1 + (back_rect.3 - FONT_CELL_H) * 0.5;
-    push_text(&mut v, size, back_label, back_lx, back_ly, [0.8, 0.88, 1.0, 1.0]);
-
-    // --- Nota de pausa en la esquina inferior del panel ---
-    let pause_text = "JUEGO PAUSADO";
-    let pause_y = panel_y + panel_h - FONT_CELL_H - 18.0;
-    push_text_centered(&mut v, size, pause_text, cx, pause_y, [0.5, 0.55, 0.65, 0.7]);
-
+    push_back_button(&mut v, size);
+    push_pause_note(&mut v, size, panel);
     v
 }
