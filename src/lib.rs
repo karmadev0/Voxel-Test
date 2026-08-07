@@ -521,8 +521,50 @@ impl State {
         // un chunk del mundo viejo al nuevo si justo llegó tarde).
         while self.chunk_result_rx.try_recv().is_ok() {}
 
-        self.camera = Camera::new(glam::Vec3::new(8.0, 40.0, 8.0));
-        self.player = Player::new(glam::Vec3::new(8.0, 40.0, 8.0));
+        // Punto de spawn: si el mundo ya tenía una partida guardada,
+        // reanudamos justo donde se dejó (posición + rotación de
+        // cámara); si es la primera vez (mundo recién creado, o un
+        // `meta.bin` de antes de que existiera `player_state`), usamos
+        // el spawn de siempre.
+        let (mut spawn_pos, spawn_yaw, spawn_pitch) = match meta.player_state {
+            Some(ps) => (
+                glam::Vec3::new(ps.feet_x, ps.feet_y, ps.feet_z),
+                ps.yaw,
+                ps.pitch,
+            ),
+            None => (glam::Vec3::new(8.0, 40.0, 8.0), -90f32.to_radians(), 0.0),
+        };
+
+        // Chequeo de spawn seguro: esto es responsabilidad del código,
+        // no del jugador (a diferencia del auto-rescate en Creativo, que
+        // solo actúa si el jugador se encerró jugando), así que corre
+        // siempre acá, en los dos casos — mundo nuevo generado o mundo
+        // viejo cargado — sin importar el modo de juego. Se resuelve
+        // ANTES de crear `Player`/`Camera` definitivos, así nunca llega
+        // a verse ni un frame atascado dentro de un bloque.
+        {
+            let probe = Player::new(spawn_pos);
+            if probe.is_trapped(&self.world) {
+                if let Some(free_pos) = probe.find_nearest_free_position(&self.world, 8) {
+                    log::warn!(
+                        "Spawn ({:.1}, {:.1}, {:.1}) estaba dentro de un bloque, reubicando a ({:.1}, {:.1}, {:.1}).",
+                        spawn_pos.x, spawn_pos.y, spawn_pos.z,
+                        free_pos.x, free_pos.y, free_pos.z,
+                    );
+                    spawn_pos = free_pos;
+                } else {
+                    log::warn!(
+                        "Spawn ({:.1}, {:.1}, {:.1}) estaba dentro de un bloque y no se encontró aire libre en 8 bloques a la redonda.",
+                        spawn_pos.x, spawn_pos.y, spawn_pos.z,
+                    );
+                }
+            }
+        }
+
+        self.camera = Camera::new(spawn_pos);
+        self.camera.yaw = spawn_yaw;
+        self.camera.pitch = spawn_pitch;
+        self.player = Player::new(spawn_pos);
         self.game_mode = GameMode::Survival;
         self.current_player_chunk = (0, 0);
         self.last_streamed_render_radius = self.render_radius;
@@ -531,6 +573,29 @@ impl State {
 
         self.game_screen = GameScreen::Playing;
         self.last_frame = Instant::now();
+    }
+
+    /// Guarda `player_state` en el `meta.bin` del mundo activo, si hay
+    /// uno cargado (`current_world_name`). Se llama SIEMPRE junto con
+    /// `World::save_dirty_chunks()` — mismo caller, mismo momento — para
+    /// que la posición nunca quede desincronizada de los chunks: no
+    /// tiene sentido guardar el terreno sin guardar dónde estabas parado
+    /// en él. Barato (un solo archivo chico), así que no hace falta
+    /// gatearlo por "solo si cambió" como sí hace `save_dirty_chunks`
+    /// con los chunks.
+    fn save_player_state_now(&self) {
+        if let Some(name) = &self.current_world_name {
+            environment::save_manager::save_player_state(
+                name,
+                environment::save_manager::PlayerState {
+                    feet_x: self.player.feet_position.x,
+                    feet_y: self.player.feet_position.y,
+                    feet_z: self.player.feet_position.z,
+                    yaw: self.camera.yaw,
+                    pitch: self.camera.pitch,
+                },
+            );
+        }
     }
 
     /// Contraparte de `start_world`: descarga el mundo actual de memoria
@@ -1394,6 +1459,7 @@ impl State {
                 return;
             }
             let saved = self.world.save_dirty_chunks();
+            self.save_player_state_now();
             if saved > 0 {
                 log::info!("Guardados {} chunks modificados al volver al menú principal.", saved);
             }
@@ -1499,6 +1565,7 @@ impl State {
         if self.last_autosave.elapsed().as_secs() >= self.autosave_interval_secs as u64 {
             self.last_autosave = Instant::now();
             let saved = self.world.save_dirty_chunks();
+            self.save_player_state_now();
             if saved > 0 {
                 log::info!("Autoguardado: {} chunks escritos a disco.", saved);
             }
@@ -2099,6 +2166,7 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(mut state) = self.state.take() {
             let saved = state.world.save_dirty_chunks();
+            state.save_player_state_now();
             if saved > 0 {
                 log::info!("Autoguardado antes de pasar a segundo plano: {} chunks.", saved);
             }
@@ -2228,6 +2296,7 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::CloseRequested => {
                     let saved = state.world.save_dirty_chunks();
+                    state.save_player_state_now();
                     if saved > 0 {
                         log::info!("Guardados {} chunks modificados antes de salir.", saved);
                     }
@@ -2479,6 +2548,7 @@ impl ApplicationHandler for App {
                             && code == winit::keyboard::KeyCode::F5
                         {
                             let saved = state.world.save_dirty_chunks();
+                            state.save_player_state_now();
                             log::info!("Guardado manual: {} chunks escritos a disco.", saved);
                         } else if event.state == ElementState::Pressed
                             && code == winit::keyboard::KeyCode::F3

@@ -41,6 +41,28 @@ pub struct WorldMeta {
     /// Segundos desde epoch. Solo se usa para ordenar la lista (más
     /// reciente primero) y, a futuro, mostrar fecha de creación.
     pub created_at: u64,
+    /// Última posición conocida del jugador (pies) + rotación de cámara,
+    /// para reanudar exactamente donde se dejó el mundo. `None` en un
+    /// mundo recién creado (todavía no se guardó ninguna partida) o en
+    /// `meta.bin` de versiones anteriores a este campo — `bincode` con
+    /// `Option` viejo/nuevo es compatible siempre que el campo se agregue
+    /// al final del struct, así que esto no rompe saves ya existentes.
+    #[serde(default)]
+    pub player_state: Option<PlayerState>,
+}
+
+/// Snapshot mínimo de dónde estaba el jugador al guardar: posición de
+/// los PIES (no de los ojos/cámara — mismo criterio que `Player::feet_position`)
+/// más `yaw`/`pitch` de la cámara, en radianes. Con esto alcanza para
+/// reconstruir tanto `Player::new` como `Camera::new` + rotación al
+/// recargar el mundo.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PlayerState {
+    pub feet_x: f32,
+    pub feet_y: f32,
+    pub feet_z: f32,
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 /// Carpeta raíz donde viven todas las carpetas de mundos, una por mundo.
@@ -177,6 +199,27 @@ pub fn load_meta(name: &str) -> Option<WorldMeta> {
     fs::read(meta_path(name))
         .ok()
         .and_then(|bytes| bincode::deserialize::<WorldMeta>(&bytes).ok())
+}
+
+/// Actualiza solo `player_state` dentro del `meta.bin` de `name` y lo
+/// reescribe. Se llama junto con `World::save_dirty_chunks()` — mismo
+/// caller, mismo momento — desde autoguardado, guardado manual (F5) y
+/// "Salir" (ver `lib.rs`). Si `meta.bin` no existe o no se puede leer
+/// (no debería pasar salvo carpeta corrupta/borrada a mano), no hace
+/// nada: no queremos crear un `meta.bin` a medias sin `seed`/`created_at`
+/// correctos.
+pub fn save_player_state(name: &str, state: PlayerState) {
+    let Some(mut meta) = load_meta(name) else {
+        log::warn!(
+            "save_player_state: no se pudo leer meta.bin de '{}', se omite guardar posición.",
+            name
+        );
+        return;
+    };
+    meta.player_state = Some(state);
+    if let Ok(bytes) = bincode::serialize(&meta) {
+        let _ = fs::write(meta_path(name), bytes);
+    }
 }
 
 /// Borra por completo la carpeta de un mundo guardado (meta + todos sus
