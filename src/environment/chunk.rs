@@ -17,6 +17,8 @@ pub enum BlockType {
     Grass,
     Dirt,
     Stone,
+    Wood,
+    Leaves,
 }
 
 impl BlockType {
@@ -28,9 +30,14 @@ impl BlockType {
             BlockType::Grass => [0.36, 0.62, 0.28],
             BlockType::Dirt => [0.46, 0.33, 0.20],
             BlockType::Stone => [0.5, 0.5, 0.52],
+            BlockType::Wood => [0.42, 0.30, 0.18],
+            BlockType::Leaves => [0.27, 0.42, 0.20],
         }
     }
 
+    /// `Leaves` queda sólida por simplicidad, igual que el resto de los
+    /// bloques del engine hoy (no hay transparencia/alpha-blend en el
+    /// mesher todavía).
     pub fn is_solid(&self) -> bool {
         !matches!(self, BlockType::Air)
     }
@@ -44,6 +51,8 @@ impl BlockType {
             BlockType::Grass => "PASTO",
             BlockType::Dirt => "TIERRA",
             BlockType::Stone => "PIEDRA",
+            BlockType::Wood => "MADERA",
+            BlockType::Leaves => "HOJAS",
         }
     }
 }

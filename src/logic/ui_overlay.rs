@@ -624,11 +624,13 @@ pub fn build_touch_overlay(
     push_circle(&mut verts, size, crouch_center, crouch_rect.2 * 0.5, [1.0, 1.0, 1.0, crouch_alpha]);
 
     // Hotbar.
-    for i in 1..=3u8 {
+    for i in 1..=5u8 {
         let block = match i {
             1 => BlockType::Grass,
             2 => BlockType::Dirt,
-            _ => BlockType::Stone,
+            3 => BlockType::Stone,
+            4 => BlockType::Wood,
+            _ => BlockType::Leaves,
         };
         let [r, g, b] = block.color();
         let rect = TouchController::rect_hotbar(size, i);

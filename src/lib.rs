@@ -1656,7 +1656,9 @@ impl ApplicationHandler for App {
                                 state.selected_block = match n {
                                     1 => BlockType::Grass,
                                     2 => BlockType::Dirt,
-                                    _ => BlockType::Stone,
+                                    3 => BlockType::Stone,
+                                    4 => BlockType::Wood,
+                                    _ => BlockType::Leaves,
                                 };
                             }
                             TouchAction::OpenPause => {
@@ -1779,13 +1781,17 @@ impl ApplicationHandler for App {
                                 winit::keyboard::KeyCode::Digit1
                                     | winit::keyboard::KeyCode::Digit2
                                     | winit::keyboard::KeyCode::Digit3
+                                    | winit::keyboard::KeyCode::Digit4
+                                    | winit::keyboard::KeyCode::Digit5
                             )
                         {
                             // Selección de bloque para colocar (hotbar simple).
                             state.selected_block = match code {
                                 winit::keyboard::KeyCode::Digit1 => BlockType::Grass,
                                 winit::keyboard::KeyCode::Digit2 => BlockType::Dirt,
-                                _ => BlockType::Stone,
+                                winit::keyboard::KeyCode::Digit3 => BlockType::Stone,
+                                winit::keyboard::KeyCode::Digit4 => BlockType::Wood,
+                                _ => BlockType::Leaves,
                             };
                         } else {
                             state.camera.process_key(code, event.state);
@@ -1806,7 +1812,7 @@ impl ApplicationHandler for App {
                     // strings en cada frame.
                     if let Some(fps) = state.tick_fps() {
                         window.set_title(&format!(
-                            "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1/2/3) | F3: debug, F5: guardar",
+                            "Voxel Engine - Fase 4 | {:.0} FPS | {} chunks | {} | Bloque: {:?} (1-5) | F3: debug, F5: guardar",
                             fps,
                             state.chunk_meshes.len(),
                             state.game_mode.label(),

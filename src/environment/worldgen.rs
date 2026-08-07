@@ -3,13 +3,32 @@
 /// calculamos una altura, y rellenamos el chunk con capas: piedra abajo,
 /// tierra encima, y pasto en la superficie. Esto corre en un hilo aparte
 /// (ver rayon en main.rs) para no bloquear el frame de renderizado.
+///
+/// Encima del terreno, `generate_chunk` también estampa árboles (ver
+/// `tree_at`/`stamp_tree` más abajo) con el mismo requisito de pureza: cada
+/// chunk se genera de forma totalmente independiente, en threads de rayon,
+/// sin acceso a los chunks vecinos.
 
 use crate::environment::chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
 use noise::{NoiseFn, Perlin};
 
+/// Cuántos bloques de margen, más allá de sus propias 16x16 columnas,
+/// recorre `generate_chunk` en busca de raíces de árbol. Un árbol
+/// enraizado del otro lado del borde puede igual estampar hojas (radio
+/// de copa 2) dentro de este chunk, así que el margen tiene que cubrir
+/// ese radio.
+const TREE_MARGIN: i32 = 2;
+
 pub struct WorldGenerator {
     noise: Perlin,
     seed: u32,
+}
+
+/// Parámetros de un árbol, derivados de forma 100% determinística de su
+/// columna raíz (ver `tree_at`). Dos llamadas con el mismo (wx, wz)
+/// siempre dan el mismo árbol, lo evalúe el chunk que lo evalúe.
+struct TreeSpec {
+    trunk_height: i32,
 }
 
 impl WorldGenerator {
@@ -45,7 +64,108 @@ impl WorldGenerator {
             }
         }
 
+        // Árboles: recorremos también un margen de columnas de chunks
+        // vecinos (todavía no generados quizás), porque la copa de un
+        // árbol enraizado justo al otro lado del borde puede pisar nuestro
+        // territorio. `tree_at` es una función pura de (seed, wx, wz) — el
+        // chunk vecino, cuando le toque generarse, va a llegar exactamente
+        // al mismo árbol para esa misma columna y va a estampar su propia
+        // parte. Ningún chunk espera al otro ni le escribe nada.
+        let origin_x = chunk_x * CHUNK_SIZE_X as i32;
+        let origin_z = chunk_z * CHUNK_SIZE_Z as i32;
+        for wx in (origin_x - TREE_MARGIN)..(origin_x + CHUNK_SIZE_X as i32 + TREE_MARGIN) {
+            for wz in (origin_z - TREE_MARGIN)..(origin_z + CHUNK_SIZE_Z as i32 + TREE_MARGIN) {
+                if let Some(tree) = self.tree_at(wx, wz) {
+                    self.stamp_tree(&mut chunk, origin_x, origin_z, wx, wz, &tree);
+                }
+            }
+        }
+
         chunk
+    }
+
+    /// ¿Hay un árbol enraizado en la columna de mundo (wx, wz)? Función
+    /// pura y sin estado (hash, no RNG): solo depende de `self.seed` y de
+    /// (wx, wz). Nunca depende de qué chunk la está evaluando ni en qué
+    /// orden, que es justamente lo que permite que dos chunks vecinos se
+    /// pongan de acuerdo sobre el mismo árbol sin coordinarse.
+    fn tree_at(&self, wx: i32, wz: i32) -> Option<TreeSpec> {
+        let height = self.height_at(wx, wz);
+        if height == 0 || height >= CHUNK_SIZE_Y {
+            return None; // sin superficie válida, o ya toca el techo del mundo
+        }
+
+        // La superficie de toda columna hoy es siempre Grass (ver el loop
+        // de arriba: el bloque en y = height - 1 siempre es Grass, no hay
+        // biomas todavía). Este chequeo queda como gancho explícito para
+        // el día que haya arena/nieve/etc. en la superficie.
+        let surface_is_grass = true;
+        if !surface_is_grass {
+            return None;
+        }
+
+        // ~2.5% de las columnas de pasto enraízan un árbol: bosque
+        // disperso, árboles sueltos y no pegados, al estilo llanura de
+        // Minecraft (no bosque denso).
+        const DENSITY_PER_MILLE: u64 = 25;
+        if hash_xz(self.seed, wx, wz) % 1000 >= DENSITY_PER_MILLE {
+            return None;
+        }
+
+        // Segundo hash (mismo seed/columna, mezclado distinto) para la
+        // altura del tronco, para que no quede correlacionada con la
+        // decisión de densidad de arriba.
+        let h2 = hash_xz(self.seed ^ 0x5EED_1234, wx, wz);
+        let trunk_height = 4 + (h2 % 3) as i32; // 4..=6, tronco recto tipo "oak"
+
+        Some(TreeSpec { trunk_height })
+    }
+
+    /// Estampa la parte de un árbol (raíz en columna de mundo wx,wz) que
+    /// cae dentro de los límites locales de *este* chunk (cuyo origen en
+    /// coordenadas de mundo es origin_x/origin_z). Nunca pisa un bloque
+    /// que no sea `Air` — ni terreno, ni tronco/hojas de otro árbol ya
+    /// estampado.
+    fn stamp_tree(
+        &self,
+        chunk: &mut Chunk,
+        origin_x: i32,
+        origin_z: i32,
+        wx: i32,
+        wz: i32,
+        tree: &TreeSpec,
+    ) {
+        let base_y = self.height_at(wx, wz) as i32; // primer bloque de aire sobre el pasto
+        let top_y = base_y + tree.trunk_height - 1; // último bloque de tronco
+
+        let mut place = |dx: i32, world_y: i32, dz: i32, block: BlockType| {
+            let local_x = wx + dx - origin_x;
+            let local_z = wz + dz - origin_z;
+            if local_x < 0
+                || local_x >= CHUNK_SIZE_X as i32
+                || local_z < 0
+                || local_z >= CHUNK_SIZE_Z as i32
+                || world_y < 0
+                || world_y >= CHUNK_SIZE_Y as i32
+            {
+                return; // cae fuera de este chunk (le toca al vecino)
+            }
+            if chunk.get(local_x, world_y, local_z) == BlockType::Air {
+                chunk.set(local_x as usize, world_y as usize, local_z as usize, block);
+            }
+        };
+
+        // Tronco recto.
+        for y in base_y..=top_y {
+            place(0, y, 0, BlockType::Wood);
+        }
+
+        // Copa: blob esférico chico en capas (dos anchas con esquinas
+        // recortadas, una angosta, una hoja sola arriba), mismo perfil
+        // "oak" clásico chico. `dy` es relativo a `top_y`.
+        for &(dx, dy, dz) in CANOPY_OFFSETS {
+            place(dx, top_y + dy, dz, BlockType::Leaves);
+        }
     }
 
     /// Combina varias octavas de ruido para un terreno con colinas suaves
@@ -73,3 +193,46 @@ impl WorldGenerator {
         self.seed
     }
 }
+
+/// Hash puro y determinístico de (seed, x, z) -> u64 (variante de
+/// splitmix64/murmur-style mixing). A propósito NO es un RNG con estado:
+/// no hay `next()`, no importa el orden de llamadas — mismos argumentos,
+/// mismo resultado siempre, lo cual es exactamente lo que necesita
+/// `tree_at` para que chunks generados en threads distintos, en
+/// cualquier orden, concuerden sobre el mismo árbol en la misma columna.
+fn hash_xz(seed: u32, x: i32, z: i32) -> u64 {
+    let mut h = (seed as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (x as i64 as u64).wrapping_mul(0xBF58476D1CE4E5B9)
+        ^ (z as i64 as u64).wrapping_mul(0x94D049BB133111EB);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D049BB133111EB);
+    h ^= h >> 31;
+    h
+}
+
+/// Offsets (dx, dy, dz) de la copa de hojas, relativos a (raíz X/Z, tope
+/// del tronco). Dos capas anchas (5x5 sin esquinas) apenas debajo del
+/// tope, una capa angosta (3x3) al nivel del tope, y una hoja sola arriba
+/// — el blob "oak" chico y redondeado de siempre.
+const CANOPY_OFFSETS: &[(i32, i32, i32)] = &[
+    // capa top_y - 2 (5x5 sin esquinas)
+    (-2, -2, -1), (-2, -2, 0), (-2, -2, 1),
+    (-1, -2, -2), (-1, -2, -1), (-1, -2, 0), (-1, -2, 1), (-1, -2, 2),
+    (0, -2, -2), (0, -2, -1), (0, -2, 0), (0, -2, 1), (0, -2, 2),
+    (1, -2, -2), (1, -2, -1), (1, -2, 0), (1, -2, 1), (1, -2, 2),
+    (2, -2, -1), (2, -2, 0), (2, -2, 1),
+    // capa top_y - 1 (5x5 sin esquinas)
+    (-2, -1, -1), (-2, -1, 0), (-2, -1, 1),
+    (-1, -1, -2), (-1, -1, -1), (-1, -1, 0), (-1, -1, 1), (-1, -1, 2),
+    (0, -1, -2), (0, -1, -1), (0, -1, 0), (0, -1, 1), (0, -1, 2),
+    (1, -1, -2), (1, -1, -1), (1, -1, 0), (1, -1, 1), (1, -1, 2),
+    (2, -1, -1), (2, -1, 0), (2, -1, 1),
+    // capa top_y (3x3)
+    (-1, 0, -1), (-1, 0, 0), (-1, 0, 1),
+    (0, 0, -1), (0, 0, 0), (0, 0, 1),
+    (1, 0, -1), (1, 0, 0), (1, 0, 1),
+    // capa top_y + 1 (una hoja sola, en cruz)
+    (0, 1, 0), (1, 1, 0), (-1, 1, 0), (0, 1, 1), (0, 1, -1),
+];

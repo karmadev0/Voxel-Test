@@ -9,7 +9,7 @@ de quedar fijo al área generada al arrancar.
 De Fases anteriores:
 - Terreno procedural, greedy meshing, backend OpenGL, generación paralela.
 - Contador de FPS en el título.
-- Romper/colocar bloques con raycasting DDA, hotbar simple (1/2/3).
+- Romper/colocar bloques con raycasting DDA, hotbar simple (1-5).
 
 Nuevo en Fase 3:
 - **Guardado/carga a disco** (`world.rs` + `chunk.rs` con `serde`/`bincode`):
@@ -158,8 +158,8 @@ respecto a desktop:
     mantiene apretado).
   - Esquina inferior derecha: dos círculos — verde coloca bloque, rojo
     rompe.
-  - Esquina superior derecha: tres cuadrados = hotbar (1/2/3, igual que
-    las teclas Digit1-3 en desktop), pintados con el mismo color que el
+  - Esquina superior derecha: cinco cuadrados = hotbar (1-5, igual que
+    las teclas Digit1-5 en desktop), pintados con el mismo color que el
     bloque que seleccionan; el activo tiene borde blanco. No hay texto
     (todavía no hay pase de fuentes en el engine).
 - Vulkan es obligatorio (sin fallback a GLES por ahora).
