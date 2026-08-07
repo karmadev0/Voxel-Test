@@ -34,7 +34,7 @@ enum PlatformLogger {
     #[cfg(not(target_os = "android"))]
     Desktop(env_logger::Logger),
     #[cfg(target_os = "android")]
-    Android(android_logger::Logger),
+    Android(android_logger::AndroidLogger),
 }
 
 impl PlatformLogger {
@@ -50,7 +50,7 @@ impl PlatformLogger {
 
     #[cfg(target_os = "android")]
     fn new() -> Self {
-        PlatformLogger::Android(android_logger::Logger::new(
+        PlatformLogger::Android(android_logger::AndroidLogger::new(
             android_logger::Config::default().with_max_level(log::LevelFilter::Info),
         ))
     }
