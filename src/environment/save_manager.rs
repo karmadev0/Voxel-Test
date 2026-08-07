@@ -187,6 +187,10 @@ pub fn create_world(name: &str) -> WorldMeta {
         name: name.clone(),
         seed,
         created_at: now_secs(),
+        // Mundo recién creado: todavía no hay ninguna partida jugada,
+        // así que no hay posición que guardar. `start_world` usa el
+        // spawn default (8,40,8) cuando esto es `None` — ver `lib.rs`.
+        player_state: None,
     };
     if let Ok(bytes) = bincode::serialize(&meta) {
         let _ = fs::write(meta_path(&name), bytes);
