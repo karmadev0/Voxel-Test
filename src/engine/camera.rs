@@ -31,6 +31,10 @@ pub struct Camera {
     // usar ambos a la vez sin que se pisen.
     touch_axis: (f32, f32),
     touch_jump: bool,
+    /// Botón táctil de agachar/bajar (segundo botón de acción, aparte de
+    /// salto). Igual que `touch_jump` con `up`, se combina por OR con la
+    /// tecla de escritorio (`down`, ShiftLeft) — ver `set_touch_down`.
+    touch_down: bool,
 }
 
 impl Camera {
@@ -49,6 +53,7 @@ impl Camera {
             down: false,
             touch_axis: (0.0, 0.0),
             touch_jump: false,
+            touch_down: false,
         }
     }
 
@@ -61,6 +66,13 @@ impl Camera {
     /// Mantiene o suelta el botón táctil de salto/subir.
     pub fn set_touch_jump(&mut self, held: bool) {
         self.touch_jump = held;
+    }
+
+    /// Mantiene o suelta el segundo botón táctil (agachar en Supervivencia,
+    /// bajar en Creativo/Espectador — ver `wants_crouch` y
+    /// `free_move_vector`/`update`).
+    pub fn set_touch_down(&mut self, held: bool) {
+        self.touch_down = held;
     }
 
     /// Aplica un delta de "mirada" venido de un drag táctil, con la misma
@@ -143,6 +155,16 @@ impl Camera {
         self.up || self.touch_jump
     }
 
+    /// En modo Supervivencia, el segundo botón táctil (o Shift izquierdo
+    /// en escritorio — mismo campo `down` que en modo vuelo significa
+    /// "bajar") se reinterpreta como agacharse: `State::update` (lib.rs)
+    /// usa esto para reducir la velocidad de movimiento y activar la
+    /// protección de borde (`Player::update`/`is_grounded_at`), igual
+    /// que `wants_jump` reinterpreta "subir" como salto.
+    pub fn wants_crouch(&self) -> bool {
+        self.down || self.touch_down
+    }
+
     /// Vector de movimiento libre en 3D (horizontal + vertical) según las
     /// teclas activas, para el modo Creativo (vuelo CON colisión, ver
     /// `Player::fly_update`). A diferencia de `update()` (vuelo de
@@ -154,7 +176,7 @@ impl Camera {
         if self.up || self.touch_jump {
             dir += Vec3::Y;
         }
-        if self.down {
+        if self.down || self.touch_down {
             dir -= Vec3::Y;
         }
         if dir.length_squared() > 1.0 {
@@ -189,7 +211,7 @@ impl Camera {
         if self.up || self.touch_jump {
             self.position += world_up * speed;
         }
-        if self.down {
+        if self.down || self.touch_down {
             self.position -= world_up * speed;
         }
 

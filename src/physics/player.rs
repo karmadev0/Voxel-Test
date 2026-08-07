@@ -64,18 +64,48 @@ impl Player {
     /// `horizontal_move` (dirección ya calculada en main.rs a partir del
     /// input WASD relativo a la cámara) y resuelve colisiones contra el
     /// mundo, eje por eje. Usado en modo Supervivencia (caminar).
-    pub fn update(&mut self, world: &World, horizontal_move: Vec3, dt: f32) {
+    ///
+    /// `crouching` activa la protección de borde de Minecraft: si el
+    /// jugador está agachado y parado en el suelo, un eje horizontal que
+    /// lo dejaría sin piso debajo se cancela en vez de dejarlo caminar
+    /// hacia el vacío (ver `is_grounded_at`, más abajo).
+    pub fn update(&mut self, world: &World, horizontal_move: Vec3, dt: f32, crouching: bool) {
         self.velocity.x = horizontal_move.x;
         self.velocity.z = horizontal_move.z;
 
         self.velocity.y = (self.velocity.y + GRAVITY * dt).max(TERMINAL_VELOCITY);
 
         let delta = self.velocity * dt;
+        let mut delta_x = delta.x;
+        let mut delta_z = delta.z;
 
-        self.move_axis(world, Vec3::new(delta.x, 0.0, 0.0));
+        // Protección de borde: solo tiene sentido si ya estamos parados
+        // en el suelo (si veníamos cayendo o saltando, dejar que la
+        // gravedad siga su curso normal — no hay "borde" del que
+        // protegerse en el aire). Cada eje se chequea por separado y
+        // contra la posición actual (no la ya desplazada por el otro
+        // eje), igual de simple que el resto de la resolución de
+        // colisiones acá — no cubre perfectamente el caso diagonal, pero
+        // alcanza para no caerse caminando en línea recta hacia un borde.
+        if crouching && self.on_ground {
+            if delta_x != 0.0 {
+                let candidate = self.feet_position + Vec3::new(delta_x, 0.0, 0.0);
+                if !self.is_grounded_at(world, candidate) {
+                    delta_x = 0.0;
+                }
+            }
+            if delta_z != 0.0 {
+                let candidate = self.feet_position + Vec3::new(0.0, 0.0, delta_z);
+                if !self.is_grounded_at(world, candidate) {
+                    delta_z = 0.0;
+                }
+            }
+        }
+
+        self.move_axis(world, Vec3::new(delta_x, 0.0, 0.0));
         self.on_ground = false;
         self.move_axis(world, Vec3::new(0.0, delta.y, 0.0));
-        self.move_axis(world, Vec3::new(0.0, 0.0, delta.z));
+        self.move_axis(world, Vec3::new(0.0, 0.0, delta_z));
     }
 
     /// Vuelo con colisión: modo Creativo. A diferencia de `update()`, no
@@ -135,6 +165,32 @@ impl Player {
                     if world.get_block(x, y, z).is_solid() {
                         return true;
                     }
+                }
+            }
+        }
+        false
+    }
+
+    /// Si parado en `pos`, hay algún bloque sólido justo debajo de la
+    /// huella en XZ del jugador (la capa de bloques a `floor(pos.y) - 1`,
+    /// bajo toda su caja de colisión en X/Z). Usado por `update` para la
+    /// protección de borde al agacharse: a diferencia de `collides_at`
+    /// (¿choco acá?), esto responde "¿me sostiene el piso acá?" — basta
+    /// con que una sola celda de la huella tenga piso para considerar la
+    /// posición sostenida, así que el jugador puede seguir parado con
+    /// medio pie sobre el borde de un bloque sin que esto lo frene de
+    /// más, igual que en Minecraft.
+    fn is_grounded_at(&self, world: &World, pos: Vec3) -> bool {
+        let min_x = (pos.x - HALF_WIDTH).floor() as i32;
+        let max_x = (pos.x + HALF_WIDTH).floor() as i32;
+        let min_z = (pos.z - HALF_WIDTH).floor() as i32;
+        let max_z = (pos.z + HALF_WIDTH).floor() as i32;
+        let y = pos.y.floor() as i32 - 1;
+
+        for x in min_x..=max_x {
+            for z in min_z..=max_z {
+                if world.get_block(x, y, z).is_solid() {
+                    return true;
                 }
             }
         }

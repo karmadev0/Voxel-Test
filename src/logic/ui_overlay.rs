@@ -607,12 +607,21 @@ pub fn build_touch_overlay(
     push_ring(&mut verts, size, base_center, JOYSTICK_VISUAL_RADIUS, JOYSTICK_VISUAL_RADIUS - 8.0, [1.0, 1.0, 1.0, 0.35]);
     push_circle(&mut verts, size, nub_center, NUB_VISUAL_RADIUS, [1.0, 1.0, 1.0, 0.55]);
 
-    // Salto: único botón de acción visible (romper/colocar ahora viven en
-    // la zona de mirar, ver touch.rs), por eso es bastante más grande.
+    // Salto: el más grande de los dos botones de acción visibles
+    // (romper/colocar viven en la zona de mirar, ver touch.rs), porque es
+    // el que se usa con más frecuencia.
     let jump_rect = TouchController::rect_jump(size);
     let jump_center = (jump_rect.0 + jump_rect.2 * 0.5, jump_rect.1 + jump_rect.3 * 0.5);
     let jump_alpha = if touch.jump_held() { 0.65 } else { 0.35 };
     push_circle(&mut verts, size, jump_center, jump_rect.2 * 0.5, [1.0, 1.0, 1.0, jump_alpha]);
+
+    // Agachar/bajar: segundo botón de acción, a la izquierda de salto y
+    // más chico. Agacha en Supervivencia, baja en Creativo/Espectador
+    // (ver Camera::wants_crouch / set_touch_down en camera.rs).
+    let crouch_rect = TouchController::rect_crouch(size);
+    let crouch_center = (crouch_rect.0 + crouch_rect.2 * 0.5, crouch_rect.1 + crouch_rect.3 * 0.5);
+    let crouch_alpha = if touch.crouch_held() { 0.65 } else { 0.35 };
+    push_circle(&mut verts, size, crouch_center, crouch_rect.2 * 0.5, [1.0, 1.0, 1.0, crouch_alpha]);
 
     // Hotbar.
     for i in 1..=3u8 {

@@ -11,9 +11,12 @@
 ///   - Mantener presionado (sin soltar rápido) → romper el bloque
 ///     apuntado, en repetición mientras el dedo siga apoyado.
 ///   - Toque rápido y sin arrastrar demasiado → colocar un bloque.
-/// Así no hacen falta botones separados de ROMPER/COLOCAR: la única
-/// acción "de botón" que queda a la vista es SALTO, más grande porque es
-/// el único que hay que poder tocar sin apuntar con precisión.
+/// Así no hacen falta botones separados de ROMPER/COLOCAR: los dos
+/// botones "de acción" que quedan a la vista son SALTO (subir en modo
+/// vuelo) y AGACHARSE (bajar en modo vuelo, ver `Zone::Crouch` y
+/// `Camera::wants_crouch`/`set_touch_down`). SALTO es más grande porque
+/// es el que se usa con más frecuencia y hay que poder tocarlo sin
+/// apuntar con precisión.
 ///
 /// Cuando se toca el engranaje, el juego pasa a `GameScreen::Settings`:
 /// se pausa toda la lógica de juego y se muestra una pantalla fullscreen
@@ -24,9 +27,9 @@
 ///   │                                        └───────┘
 ///   │            mirar (drag) /
 ///   │     mantener = romper, toque = colocar
-///   │           (mitad derecha)                ┌─────┐
-///   ├────────────────┐                         │SALTO│  <- más grande, esquina
-///   │   moverse       │                        └─────┘
+///   │           (mitad derecha)          ┌──────┐┌─────┐
+///   ├────────────────┐                   │AGACH.││SALTO│  <- esquina inf. dcha
+///   │   moverse       │                  └──────┘└─────┘
 ///   │  (joystick,     │
 ///   │ mitad izq.)     │
 ///   │                 └───── hotbar (1 2 3) ──┘
@@ -44,6 +47,12 @@ const JOYSTICK_RADIUS: f64 = 70.0;
 /// compartido con romper/colocar (90px) para que sea fácil de tocar sin
 /// mirar el dedo.
 const JUMP_BUTTON_SIZE: f64 = 140.0;
+
+/// Tamaño del botón de agachar/bajar: segundo botón de acción, más chico
+/// que salto porque se usa con menos frecuencia (ver `rect_crouch`).
+const CROUCH_BUTTON_SIZE: f64 = 100.0;
+/// Espacio, en píxeles físicos, entre el botón de salto y el de agachar.
+const ACTION_BUTTON_GAP: f64 = 16.0;
 const HOTBAR_SIZE: f64 = 64.0;
 const HOTBAR_GAP: f64 = 12.0;
 const MARGIN: f64 = 24.0;
@@ -141,6 +150,9 @@ enum Zone {
     Movement,
     Look,
     Jump,
+    /// Segundo botón de acción: agacharse en Supervivencia, bajar en
+    /// Creativo/Espectador (ver `Camera::wants_crouch`/`set_touch_down`).
+    Crouch,
 }
 
 struct ActiveDrag {
@@ -161,6 +173,7 @@ pub struct TouchController {
     pending_look_dx: f32,
     pending_look_dy: f32,
     jump_held: bool,
+    crouch_held: bool,
 }
 
 impl TouchController {
@@ -170,6 +183,7 @@ impl TouchController {
             pending_look_dx: 0.0,
             pending_look_dy: 0.0,
             jump_held: false,
+            crouch_held: false,
         }
     }
 
@@ -179,6 +193,15 @@ impl TouchController {
         let x = size.width as f64 - MARGIN - JUMP_BUTTON_SIZE;
         let y = size.height as f64 - MARGIN - JUMP_BUTTON_SIZE;
         (x, y, JUMP_BUTTON_SIZE, JUMP_BUTTON_SIZE)
+    }
+
+    /// Botón de agachar/bajar: a la izquierda del de salto, más chico y
+    /// alineado por abajo con él (mismo borde inferior).
+    pub(crate) fn rect_crouch(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let jump = Self::rect_jump(size);
+        let x = jump.0 - ACTION_BUTTON_GAP - CROUCH_BUTTON_SIZE;
+        let y = jump.1 + jump.3 - CROUCH_BUTTON_SIZE;
+        (x, y, CROUCH_BUTTON_SIZE, CROUCH_BUTTON_SIZE)
     }
 
     pub(crate) fn rect_hotbar(size: PhysicalSize<u32>, index: u8) -> (f64, f64, f64, f64) {
@@ -361,6 +384,9 @@ impl TouchController {
         if Self::point_in_rect(pos, Self::rect_jump(size)) {
             return Some(Zone::Jump);
         }
+        if Self::point_in_rect(pos, Self::rect_crouch(size)) {
+            return Some(Zone::Crouch);
+        }
         if pos.0 < size.width as f64 * 0.5 {
             Some(Zone::Movement)
         } else {
@@ -388,6 +414,7 @@ impl TouchController {
                     // Soltar drags activos para no dejar el joystick pegado.
                     self.drags.clear();
                     self.jump_held = false;
+                    self.crouch_held = false;
                     return Some(TouchAction::OpenPause);
                 }
                 for i in 1..=3u8 {
@@ -398,6 +425,9 @@ impl TouchController {
                 if let Some(zone) = Self::zone_for(pos, size) {
                     if zone == Zone::Jump {
                         self.jump_held = true;
+                    }
+                    if zone == Zone::Crouch {
+                        self.crouch_held = true;
                     }
                     self.drags.insert(
                         touch.id,
@@ -426,6 +456,9 @@ impl TouchController {
                 if let Some(drag) = self.drags.remove(&touch.id) {
                     if drag.zone == Zone::Jump {
                         self.jump_held = false;
+                    }
+                    if drag.zone == Zone::Crouch {
+                        self.crouch_held = false;
                     }
                     if drag.zone == Zone::Look && touch.phase == TouchPhase::Ended {
                         let dx = drag.last.0 - drag.start.0;
@@ -629,5 +662,9 @@ impl TouchController {
 
     pub fn jump_held(&self) -> bool {
         self.jump_held
+    }
+
+    pub fn crouch_held(&self) -> bool {
+        self.crouch_held
     }
 }

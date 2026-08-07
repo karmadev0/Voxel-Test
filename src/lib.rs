@@ -566,7 +566,7 @@ impl State {
     /// en `update`), para que la física normal no compita contra el
     /// arrastre frame a frame.
     fn step_rescue_drag(&mut self, target: glam::Vec3, dt: f32) {
-        const RESCUE_SPEED: f32 = 0.5; // bloques por segundo
+        const RESCUE_SPEED: f32 = 1.25; // bloques por segundo (x2.5 respecto al original)
 
         let current = self.player.feet_position;
         let delta = target - current;
@@ -888,6 +888,7 @@ impl State {
         // antes de moverla, con la misma interfaz que usan las teclas.
         self.camera.set_touch_move_axis(self.touch.move_axis());
         self.camera.set_touch_jump(self.touch.jump_held());
+        self.camera.set_touch_down(self.touch.crouch_held());
         let (look_dx, look_dy) = self.touch.take_look_delta();
         if look_dx != 0.0 || look_dy != 0.0 {
             self.camera.process_touch_look(look_dx, look_dy);
@@ -912,14 +913,24 @@ impl State {
                     if self.camera.wants_jump() {
                         self.player.jump();
                     }
-                    let horizontal = self.camera.horizontal_move_vector(4.5);
-                    self.player.update(&self.world, horizontal, dt);
+                    // Agacharse (botón táctil de "bajar" o Shift izquierdo
+                    // en escritorio, ver Camera::wants_crouch) reduce la
+                    // velocidad de caminata, como el sneak de Minecraft.
+                    const CROUCH_SPEED_FACTOR: f32 = 0.3;
+                    let speed = if self.camera.wants_crouch() {
+                        4.5 * CROUCH_SPEED_FACTOR
+                    } else {
+                        4.5
+                    };
+                    let horizontal = self.camera.horizontal_move_vector(speed);
+                    self.player.update(&self.world, horizontal, dt, self.camera.wants_crouch());
                     self.camera.position = self.player.eye_position();
                 }
                 GameMode::Creative => {
                     // Vuelo con colisión: no atraviesa bloques, pero sin
                     // gravedad ni salto — subir/bajar es directo con
-                    // Espacio/Shift (ver Camera::free_move_vector).
+                    // Espacio/Shift, o con los botones táctiles de salto/
+                    // agachar (ver Camera::free_move_vector).
                     let free_move = self.camera.free_move_vector(8.0);
                     self.player.fly_update(&self.world, free_move, dt);
                     self.camera.position = self.player.eye_position();
