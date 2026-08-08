@@ -416,8 +416,11 @@ struct State {
 }
 
 impl State {
-    async fn new(window: Arc<winit::window::Window>) -> Self {
-        let render = engine::render_state::RenderState::new(window).await;
+    async fn new(
+        window: Arc<winit::window::Window>,
+        display_handle: winit::event_loop::OwnedDisplayHandle,
+    ) -> Self {
+        let render = engine::render_state::RenderState::new(window, display_handle).await;
 
         // Ya no se genera terreno acá: la app arranca en `MainMenu` y el
         // mundo de verdad recién se crea/carga cuando el jugador elige
@@ -661,8 +664,12 @@ impl State {
     /// de GPU de cada chunk, pero reusa los chunks, la cámara, el
     /// jugador y los ajustes tal cual estaban — no vuelve a generar ni a
     /// leer nada de disco que no hiciera falta.
-    async fn resume(window: Arc<winit::window::Window>, session: SavedSession) -> Self {
-        let render = engine::render_state::RenderState::new(window).await;
+    async fn resume(
+        window: Arc<winit::window::Window>,
+        session: SavedSession,
+        display_handle: winit::event_loop::OwnedDisplayHandle,
+    ) -> Self {
+        let render = engine::render_state::RenderState::new(window, display_handle).await;
 
         let mut world = World::new(session.seed, session.save_dir);
         for (&(cx, cz), chunk) in session.chunks.iter() {
@@ -2091,6 +2098,13 @@ struct App {
     // mundos) — ahí no hace falta preservar nada, `State::new()` normal
     // alcanza.
     saved_session: Option<SavedSession>,
+
+    // `OwnedDisplayHandle` del `EventLoop`, seteado una sola vez en
+    // `run()`/`android_main` antes de `run_app`. Se lo pasamos a
+    // `RenderState::new` (vía `State::new`/`State::resume`) para que wgpu
+    // pueda inicializar el backend GL/EGL correctamente en Wayland — ver
+    // el comentario en `run()` y en `render_state.rs`.
+    display_handle: Option<winit::event_loop::OwnedDisplayHandle>,
 }
 
 impl App {
@@ -2143,7 +2157,11 @@ impl ApplicationHandler for App {
                     .with_title("Voxel Engine - Fase 4")
                     .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
                 let win = Arc::new(event_loop.create_window(attrs).unwrap());
-                let new_state = pollster::block_on(State::new(win.clone()));
+                let display_handle = self
+                    .display_handle
+                    .clone()
+                    .expect("display_handle no seteado (ver run())");
+                let new_state = pollster::block_on(State::new(win.clone(), display_handle));
                 self.window = Some(win);
                 self.state = Some(new_state);
                 #[cfg(target_os = "android")]
@@ -2156,9 +2174,15 @@ impl ApplicationHandler for App {
                 // restauramos desde ahí en vez de arrancar de cero — así el
                 // mundo no se pierde ni hay que releerlo entero de disco.
                 let win = self.window.as_ref().unwrap();
+                let display_handle = self
+                    .display_handle
+                    .clone()
+                    .expect("display_handle no seteado (ver run())");
                 self.state = Some(match self.saved_session.take() {
-                    Some(session) => pollster::block_on(State::resume(win.clone(), session)),
-                    None => pollster::block_on(State::new(win.clone())),
+                    Some(session) => {
+                        pollster::block_on(State::resume(win.clone(), session, display_handle))
+                    }
+                    None => pollster::block_on(State::new(win.clone(), display_handle)),
                 });
                 #[cfg(target_os = "android")]
                 immersive::apply_immersive_fullscreen();
@@ -2692,6 +2716,12 @@ impl ApplicationHandler for App {
 pub fn run(event_loop: EventLoop<()>, startup_crash: Option<String>) {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();
+    // wgpu necesita este handle para inicializar bien el backend GL/EGL en
+    // Wayland (ver InstanceDescriptor::display en render_state.rs). Sin
+    // esto, wgpu-hal no encuentra el compositor y cae a EGL "surfaceless",
+    // lo que hace que request_adapter() no encuentre ningún adaptador
+    // compatible con la surface real de la ventana.
+    app.display_handle = Some(event_loop.owned_display_handle());
     if let Some(short_message) = startup_crash {
         app.crashed = true;
         app.crash_short_message = Some(short_message);

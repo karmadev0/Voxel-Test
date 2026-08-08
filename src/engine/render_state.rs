@@ -110,7 +110,10 @@ impl RenderState {
     /// buffers asociados. `window` solo se usa acá (crear la surface y
     /// leer el tamaño inicial) — el resto de `State::new` (mundo, cámara,
     /// jugador, streaming) no lo necesita.
-    pub async fn new(window: Arc<winit::window::Window>) -> Self {
+    pub async fn new(
+        window: Arc<winit::window::Window>,
+        display_handle: winit::event_loop::OwnedDisplayHandle,
+    ) -> Self {
         let size = window.inner_size();
 
         // Forzamos el backend GL explícitamente: en el hardware objetivo
@@ -148,7 +151,12 @@ impl RenderState {
                     flags: wgpu::InstanceFlags::default(),
                     memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
                     backend_options: wgpu::BackendOptions::default(),
-                    display: None,
+                    // Sin esto, wgpu-hal no encuentra el compositor
+                    // (Wayland/X11) al armar el EGLDisplay y cae a EGL
+                    // "surfaceless" — ahí ningún adapter resulta compatible
+                    // con la surface real de la ventana ("No config
+                    // found!" en los logs de wgpu_hal::gles::egl).
+                    display: Some(Box::new(display_handle.clone())),
                 });
                 let gl_surface = gl_instance.create_surface(window.clone());
                 (gl_instance, gl_surface)
@@ -182,7 +190,7 @@ impl RenderState {
                         flags: wgpu::InstanceFlags::default(),
                         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
                         backend_options: wgpu::BackendOptions::default(),
-                        display: None,
+                        display: Some(Box::new(display_handle.clone())),
                     });
                     let fallback_surface = fallback_instance
                         .create_surface(window.clone())
@@ -198,6 +206,10 @@ impl RenderState {
         };
         #[cfg(target_os = "android")]
         let (instance, surface) = {
+            // No hace falta acá: wgpu ignora `display` en el backend
+            // Vulkan (ver doc de InstanceDescriptor::display), que es el
+            // que se fuerza abajo en Android.
+            let _ = &display_handle;
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::VULKAN,
                 flags: wgpu::InstanceFlags::default(),
