@@ -2520,14 +2520,34 @@ impl ApplicationHandler for App {
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         if state.game_screen == GameScreen::NameWorld {
-                            // Con el IME ya puesto, del teclado físico
-                            // solo hacen falta las teclas de control que
-                            // el IME no manda como `Ime::Commit`: borrar,
-                            // confirmar y cancelar. Mientras esta
-                            // pantalla está abierta el resto del teclado
-                            // (cámara, F3, etc.) sigue deshabilitado a
-                            // propósito, para no mover al jugador
-                            // mientras tipea.
+                            // Los caracteres normales llegan por
+                            // `WindowEvent::Ime` (`Ime::Commit`) cuando el
+                            // compositor/SO tiene soporte de IME (Android
+                            // siempre; en desktop depende del compositor
+                            // de Wayland — algunos no implementan el
+                            // protocolo `text-input`, y ahí no se recibe
+                            // ni un solo evento `Ime`, ni siquiera
+                            // `Ime::Enabled`, aunque `set_ime_allowed`
+                            // esté bien puesto).
+                            //
+                            // Por eso además de las teclas de control de
+                            // siempre, leemos acá `event.text` — el texto
+                            // que produce esta tecla física según el
+                            // layout activo (con mayúsculas/símbolos ya
+                            // resueltos), que SIEMPRE llega sin importar
+                            // el compositor. Es la misma fuente que ya
+                            // usa Android en el explorador de archivos,
+                            // solo que a través de un camino distinto.
+                            //
+                            // Riesgo de caracteres duplicados: si algún
+                            // día un compositor manda Ime::Commit Y
+                            // encima `event.text` para la misma tecla,
+                            // se escribiría dos veces. No pasa hoy en
+                            // ninguna plataforma que probamos (desktop:
+                            // cero eventos Ime; Android: IME sin
+                            // `event.text` en teclado en pantalla), pero
+                            // si aparece, la solución sería filtrar acá
+                            // por plataforma en vez de sacar esta rama.
                             if event.state == ElementState::Pressed {
                                 use winit::keyboard::KeyCode;
                                 match code {
@@ -2540,7 +2560,13 @@ impl ApplicationHandler for App {
                                     KeyCode::Escape => {
                                         state.apply_menu_action(TouchAction::Back, event_loop, window);
                                     }
-                                    _ => {}
+                                    _ => {
+                                        if let Some(text) = &event.text {
+                                            for c in text.chars().filter(|c| !c.is_control()) {
+                                                state.apply_menu_action(TouchAction::KeyboardChar(c), event_loop, window);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else if code == winit::keyboard::KeyCode::Escape
