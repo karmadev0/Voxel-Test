@@ -63,6 +63,22 @@ impl WorldGenerator {
                 let height = self.height_at(world_x, world_z);
 
                 for y in 0..height.min(CHUNK_SIZE_Y) {
+                    // Cuevas: la mayor parte del mapa mantiene el
+                    // colchón bajo pasto/tierra (ver `is_cave`), así que
+                    // acá abajo solo se corta piedra. Pero en las zonas
+                    // raras de "entrada" ese colchón baja a 0 a
+                    // propósito, y ahí sí hace falta poder tallar
+                    // también tierra/pasto para que la cueva llegue de
+                    // verdad hasta el aire — por eso este chequeo va
+                    // antes de decidir el tipo de bloque, sin filtrar
+                    // por tipo. El chunk arranca todo `Air`
+                    // (`Chunk::empty()`), así que "no poner nada" es
+                    // exactamente lo que hace falta para que quede
+                    // hueco.
+                    if self.is_cave(world_x, y as i32, world_z, height) {
+                        continue;
+                    }
+
                     let block = if y == height - 1 {
                         BlockType::Grass
                     } else if y >= height.saturating_sub(4) {
@@ -70,16 +86,6 @@ impl WorldGenerator {
                     } else {
                         BlockType::Stone
                     };
-
-                    // Cuevas: solo tallamos dentro de la piedra (no
-                    // debajo del pasto/tierra, ver `is_cave` para el
-                    // colchón bajo la superficie). El chunk arranca
-                    // todo `Air` (`Chunk::empty()`), así que "no poner
-                    // nada" es exactamente lo que hace falta para que
-                    // quede hueco.
-                    if block == BlockType::Stone && self.is_cave(world_x, y as i32, world_z, height) {
-                        continue;
-                    }
 
                     chunk.set(local_x, y, local_z, block);
                 }
@@ -119,9 +125,11 @@ impl WorldGenerator {
 
         // La superficie de toda columna hoy es siempre Grass (ver el loop
         // de arriba: el bloque en y = height - 1 siempre es Grass, no hay
-        // biomas todavía). Este chequeo queda como gancho explícito para
-        // el día que haya arena/nieve/etc. en la superficie.
-        let surface_is_grass = true;
+        // biomas todavía) — salvo que una entrada de cueva rara (ver
+        // `is_cave`) se haya comido justo ese bloque, en cuyo caso no hay
+        // nada sólido donde enraizar y el árbol quedaría flotando sobre
+        // el agujero.
+        let surface_is_grass = !self.is_cave(wx, height as i32 - 1, wz, height);
         if !surface_is_grass {
             return None;
         }
@@ -191,51 +199,91 @@ impl WorldGenerator {
     }
 
     /// ¿El bloque de mundo (wx, wy, wz) cae dentro de una cueva? Función
-    /// pura (mismo espíritu que `tree_at`): solo depende de `wx/wy/wz`
-    /// y de `cave_noise`, nunca del chunk que la evalúa ni del orden —
-    /// así dos chunks vecinos (generados en threads/orden distintos)
-    /// siempre concuerdan en dónde está el hueco de una cueva que cruza
-    /// el borde entre los dos.
+    /// pura (mismo espíritu que `tree_at`): depende solo de wx/wy/wz y
+    /// de los campos de ruido, nunca del chunk que la evalúa ni del
+    /// orden en que se generan los chunks vecinos.
+    ///
+    /// Combina dos "familias" de cueva, como en Minecraft moderno:
+    /// - "queso" (`cheese`): cavernas anchas e irregulares, salones
+    ///   grandes.
+    /// - "fideo"/túnel (`noodle`): pasillos angostos y serpenteantes,
+    ///   largos — la técnica clásica de "gusanos de Perlin": dos campos
+    ///   de ruido 3D independientes, y donde los DOS están cerca de
+    ///   cero a la vez queda un tubo hueco. Así se arman las cuevas
+    ///   kilométricas en vez de solo bolsones sueltos.
+    ///
+    /// Encima, dos ruidos de frecuencia muy baja (regiones mucho más
+    /// grandes que un chunk) le dan variedad zona por zona:
+    /// - `region_bias`: baja el umbral en algunas zonas (cuevas
+    ///   grandes e interconectadas ahí) y lo sube en otras (bolsones
+    ///   chicos y sueltos, o casi nada).
+    /// - `entrance_bias`: en parches raros y esparcidos, achica el
+    ///   colchón bajo la superficie casi a cero. Ahí, si la cueva pasa
+    ///   cerca, perfora tierra y pasto y se abre como boca de cueva o
+    ///   sumidero por el que se puede entrar caminando. En el resto del
+    ///   mapa el colchón normal se mantiene, para que no quede el
+    ///   terreno lleno de agujeritos al azar.
     fn is_cave(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
-        // Colchón sólido bajo el pasto/tierra (para que no se abran
-        // agujeros pegados a la superficie) y sobre el piso del mundo
-        // (para que no queden cuevas sin fondo, aunque hoy no hay caída
-        // infinita implementada igual).
-        const SURFACE_BUFFER: i32 = 4;
         const FLOOR_BUFFER: i32 = 2;
-        let ceiling = surface_height as i32 - SURFACE_BUFFER;
+
+        let region_bias = self
+            .noise
+            .get([wx as f64 * 0.008 + 7_000.0, wz as f64 * 0.008 + 7_000.0]);
+        let entrance_bias = self
+            .noise
+            .get([wx as f64 * 0.006 + 40_000.0, wz as f64 * 0.006 + 40_000.0]);
+
+        const ENTRANCE_THRESHOLD: f64 = 0.55;
+        let surface_buffer = if entrance_bias > ENTRANCE_THRESHOLD { 0 } else { 4 };
+        let ceiling = surface_height as i32 - surface_buffer;
         if wy < FLOOR_BUFFER || wy > ceiling {
             return false;
         }
 
-        // Dos octavas de ruido 3D, una gruesa (forma general de la
-        // caverna) y una fina (paredes irregulares en vez de burbuja
-        // lisa). El eje Y con más frecuencia que X/Z aplasta un poco
-        // las cuevas verticalmente, para que se sientan más "túnel
-        // horizontal" que "esfera flotando" — mismo truco que ya usa
-        // `height_at` con base/detail, aplicado en 3D.
-        let base_freq = 0.045;
-        let detail_freq = 0.12;
-
+        // --- Cavernas "queso" ---
         let base = self.cave_noise.get([
-            wx as f64 * base_freq,
-            wy as f64 * base_freq * 1.6,
-            wz as f64 * base_freq,
+            wx as f64 * 0.045,
+            wy as f64 * 0.045 * 1.6,
+            wz as f64 * 0.045,
         ]);
         let detail = self.cave_noise.get([
-            wx as f64 * detail_freq + 500.0,
-            wy as f64 * detail_freq * 1.6 + 500.0,
-            wz as f64 * detail_freq + 500.0,
+            wx as f64 * 0.12 + 500.0,
+            wy as f64 * 0.12 * 1.6 + 500.0,
+            wz as f64 * 0.12 + 500.0,
         ]);
+        let cheese_value = base * 0.75 + detail * 0.25;
+        // region_bias en [-1, 1]: hasta ±0.18 de corrimiento del umbral
+        // base (0.62) — suficiente para que algunas zonas tengan
+        // cavernas bastante más grandes/frecuentes que otras.
+        let cheese_threshold = 0.62 - region_bias * 0.18;
+        let is_cheese = cheese_value > cheese_threshold;
 
-        let combined = base * 0.75 + detail * 0.25;
+        // --- Túneles "fideo" ---
+        // Frecuencia baja y estirado en Y (0.5x) para que serpenteen
+        // más horizontal que vertical, como pasillos reales y no pozos
+        // rectos.
+        let tunnel_freq = 0.02;
+        let t1 = self.cave_noise.get([
+            wx as f64 * tunnel_freq + 9_000.0,
+            wy as f64 * tunnel_freq * 0.5 + 9_000.0,
+            wz as f64 * tunnel_freq + 9_000.0,
+        ]);
+        let t2 = self.cave_noise.get([
+            wx as f64 * tunnel_freq - 9_000.0,
+            wy as f64 * tunnel_freq * 0.5 - 9_000.0,
+            wz as f64 * tunnel_freq - 9_000.0,
+        ]);
+        let tunnel_value = t1.abs() + t2.abs();
+        // Umbral chico a propósito: "los dos campos cerca de cero a la
+        // vez" es raro por definición, así el tubo sale angosto en vez
+        // de una franja ancha. `region_bias` solo lo agranda (nunca lo
+        // achica más) en las mismas zonas "grandes" que ya agranda el
+        // queso, para que ahí los dos tipos de cueva se sientan parte
+        // del mismo sistema conectado.
+        let tunnel_threshold = 0.06 + region_bias.max(0.0) * 0.04;
+        let is_tunnel = tunnel_value < tunnel_threshold;
 
-        // Umbral alto: el ruido Perlin 3D pasa la mayor parte del
-        // tiempo cerca de 0, así que "> 0.6" deja cavernas esparcidas y
-        // razonablemente huecas en vez de comerse toda la piedra. Bajar
-        // este número da cuevas más grandes/frecuentes.
-        const CAVE_THRESHOLD: f64 = 0.62;
-        combined > CAVE_THRESHOLD
+        is_cheese || is_tunnel
     }
 
     /// Combina varias octavas de ruido para un terreno con colinas suaves
