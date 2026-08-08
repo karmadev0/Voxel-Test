@@ -205,50 +205,58 @@ impl WorldGenerator {
     ///
     /// Combina dos "familias" de cueva, como en Minecraft moderno:
     /// - "queso" (`cheese`): cavernas anchas e irregulares, salones
-    ///   grandes.
-    /// - "fideo"/túnel (`noodle`): pasillos angostos y serpenteantes,
-    ///   largos — la técnica clásica de "gusanos de Perlin": dos campos
-    ///   de ruido 3D independientes, y donde los DOS están cerca de
-    ///   cero a la vez queda un tubo hueco. Así se arman las cuevas
-    ///   kilométricas en vez de solo bolsones sueltos.
+    ///   grandes — más anchas que altas a propósito (ver el
+    ///   multiplicador de Y más abajo).
+    /// - "fideo"/túnel (`noodle`): pasillos largos y serpenteantes,
+    ///   también más anchos/largos que altos — la técnica clásica de
+    ///   "gusanos de Perlin": dos campos de ruido 3D independientes, y
+    ///   donde los DOS están cerca de cero a la vez queda un tubo
+    ///   hueco.
     ///
-    /// Encima, dos ruidos de frecuencia muy baja (regiones mucho más
-    /// grandes que un chunk) le dan variedad zona por zona:
-    /// - `region_bias`: baja el umbral en algunas zonas (cuevas
-    ///   grandes e interconectadas ahí) y lo sube en otras (bolsones
-    ///   chicos y sueltos, o casi nada).
-    /// - `entrance_bias`: en parches raros y esparcidos, achica el
-    ///   colchón bajo la superficie casi a cero. Ahí, si la cueva pasa
-    ///   cerca, perfora tierra y pasto y se abre como boca de cueva o
-    ///   sumidero por el que se puede entrar caminando. En el resto del
-    ///   mapa el colchón normal se mantiene, para que no quede el
-    ///   terreno lleno de agujeritos al azar.
+    /// `region_bias` (ruido de zona, mucho más grande que un chunk) le
+    /// da variedad región por región: en algunas zonas los umbrales
+    /// bajan (cuevas grandes e interconectadas) y en otras suben
+    /// (bolsones chicos y sueltos, o casi nada).
+    ///
+    /// Las salidas a la superficie NO dependen de que este ruido
+    /// "por casualidad" llegue arriba (con eso nunca coincidía, quedaba
+    /// todo sellado) — ver `entrance_shaft` más abajo, que garantiza un
+    /// pozo real en zonas raras y esparcidas.
     fn is_cave(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
         const FLOOR_BUFFER: i32 = 2;
+        const SURFACE_BUFFER: i32 = 4;
+        let ceiling = surface_height as i32 - SURFACE_BUFFER;
+        if wy < FLOOR_BUFFER {
+            return false;
+        }
+
+        // Pozo de entrada: garantizado, no depende de coincidir con una
+        // cueva. Ver `entrance_shaft`.
+        if self.entrance_shaft(wx, wy, wz, surface_height) {
+            return true;
+        }
+
+        if wy > ceiling {
+            return false; // fuera del pozo de entrada, sellado como siempre
+        }
 
         let region_bias = self
             .noise
             .get([wx as f64 * 0.008 + 7_000.0, wz as f64 * 0.008 + 7_000.0]);
-        let entrance_bias = self
-            .noise
-            .get([wx as f64 * 0.006 + 40_000.0, wz as f64 * 0.006 + 40_000.0]);
-
-        const ENTRANCE_THRESHOLD: f64 = 0.55;
-        let surface_buffer = if entrance_bias > ENTRANCE_THRESHOLD { 0 } else { 4 };
-        let ceiling = surface_height as i32 - surface_buffer;
-        if wy < FLOOR_BUFFER || wy > ceiling {
-            return false;
-        }
 
         // --- Cavernas "queso" ---
+        // Y con más frecuencia que X/Z (2.5x): la caverna cambia más
+        // rápido al moverse en vertical que en horizontal, así que
+        // queda comprimida en altura (salones de ~4-8 bloques) pero se
+        // extiende mucho más en el plano — ancha, no un pozo alto.
         let base = self.cave_noise.get([
             wx as f64 * 0.045,
-            wy as f64 * 0.045 * 1.6,
+            wy as f64 * 0.045 * 2.5,
             wz as f64 * 0.045,
         ]);
         let detail = self.cave_noise.get([
             wx as f64 * 0.12 + 500.0,
-            wy as f64 * 0.12 * 1.6 + 500.0,
+            wy as f64 * 0.12 * 2.5 + 500.0,
             wz as f64 * 0.12 + 500.0,
         ]);
         let cheese_value = base * 0.75 + detail * 0.25;
@@ -259,18 +267,18 @@ impl WorldGenerator {
         let is_cheese = cheese_value > cheese_threshold;
 
         // --- Túneles "fideo" ---
-        // Frecuencia baja y estirado en Y (0.5x) para que serpenteen
-        // más horizontal que vertical, como pasillos reales y no pozos
-        // rectos.
+        // Mismo truco que arriba pero más marcado (3x en vez de 2.5x):
+        // pasillos bajos (2-4 bloques de alto) que se estiran mucho en
+        // horizontal — un corredor real, no una chimenea vertical.
         let tunnel_freq = 0.02;
         let t1 = self.cave_noise.get([
             wx as f64 * tunnel_freq + 9_000.0,
-            wy as f64 * tunnel_freq * 0.5 + 9_000.0,
+            wy as f64 * tunnel_freq * 3.0 + 9_000.0,
             wz as f64 * tunnel_freq + 9_000.0,
         ]);
         let t2 = self.cave_noise.get([
             wx as f64 * tunnel_freq - 9_000.0,
-            wy as f64 * tunnel_freq * 0.5 - 9_000.0,
+            wy as f64 * tunnel_freq * 3.0 - 9_000.0,
             wz as f64 * tunnel_freq - 9_000.0,
         ]);
         let tunnel_value = t1.abs() + t2.abs();
@@ -280,10 +288,37 @@ impl WorldGenerator {
         // achica más) en las mismas zonas "grandes" que ya agranda el
         // queso, para que ahí los dos tipos de cueva se sientan parte
         // del mismo sistema conectado.
-        let tunnel_threshold = 0.06 + region_bias.max(0.0) * 0.04;
+        let tunnel_threshold = 0.07 + region_bias.max(0.0) * 0.05;
         let is_tunnel = tunnel_value < tunnel_threshold;
 
         is_cheese || is_tunnel
+    }
+
+    /// Pozo de entrada garantizado: en parches raros y esparcidos
+    /// (definidos por `entrance_bias`, ruido 2D de frecuencia baja —
+    /// las manchas irregulares que forma son directamente la silueta
+    /// del pozo, nada de círculo perfecto) queda un hueco real desde
+    /// bien abajo hasta la superficie. A diferencia de esperar que
+    /// `is_cave` coincida "por casualidad" cerca del techo (que en la
+    /// práctica casi nunca pasaba), esto asegura que sí haya por dónde
+    /// entrar caminando.
+    fn entrance_shaft(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
+        const ENTRANCE_FREQ: f64 = 0.035;
+        const ENTRANCE_THRESHOLD: f64 = 0.42;
+        // Cuánto baja el pozo por debajo de la superficie: suficiente
+        // para que casi siempre termine conectando con alguna caverna
+        // o túnel de más abajo en vez de quedar un pozo ciego.
+        const SHAFT_DEPTH: i32 = 20;
+
+        let entrance_bias = self
+            .noise
+            .get([wx as f64 * ENTRANCE_FREQ + 40_000.0, wz as f64 * ENTRANCE_FREQ + 40_000.0]);
+        if entrance_bias <= ENTRANCE_THRESHOLD {
+            return false;
+        }
+
+        let shaft_bottom = (surface_height as i32 - SHAFT_DEPTH).max(2);
+        wy >= shaft_bottom
     }
 
     /// Combina varias octavas de ruido para un terreno con colinas suaves
