@@ -180,7 +180,29 @@ pub fn install(log_dir: Option<PathBuf>) {
     // esto, `log`'s macros filtran todo antes de siquiera preguntarle a
     // `enabled()` (mismo motivo por el que `env_logger::init()` también
     // lo hacía puertas adentro).
-    log::set_max_level(log::LevelFilter::Info);
+    //
+    // Antes esto estaba fijo en `Info`, lo que silenciaba los logs
+    // `debug`/`trace` de `wgpu_hal`/`wgpu_core` aunque seteáramos
+    // `RUST_LOG=wgpu_hal=trace` — esos son justo los que hacen falta
+    // para diagnosticar por qué falla la selección de backend/adapter
+    // en GPUs viejas. Ahora respeta `RUST_LOG` si está seteada (mismo
+    // comportamiento que `env_logger::init()` de toda la vida), y cae a
+    // `Info` si no.
+    let max_level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| {
+            // Soporta tanto `RUST_LOG=debug` (nivel global simple) como
+            // `RUST_LOG=wgpu_hal=trace` (por-módulo): si hay un `=`,
+            // nos quedamos con lo de después del último para no romper
+            // con `RUST_LOG=wgpu_hal=trace,wgpu_core=debug` (usamos el
+            // más verboso de los dos).
+            s.split(',')
+                .filter_map(|part| part.rsplit('=').next())
+                .filter_map(|lvl| lvl.trim().parse::<log::LevelFilter>().ok())
+                .max()
+        })
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(max_level);
     if let Err(e) = log::set_boxed_logger(Box::new(logger)) {
         eprintln!("No se pudo instalar el logger (¿ya había uno instalado?): {}", e);
     }
