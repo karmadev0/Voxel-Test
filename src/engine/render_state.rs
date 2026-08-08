@@ -231,11 +231,11 @@ impl RenderState {
 
         #[cfg(target_os = "android")]
         let (surface, adapter) = match adapter {
-            Some(adapter) => (surface, adapter),
-            None => {
+            Ok(adapter) => (surface, adapter),
+            Err(e) => {
                 log::warn!(
-                    "Vulkan no encontró un adaptador GPU compatible (driver \
-                     roto/ausente en esta ROM/dispositivo); reintentando con GLES."
+                    "Vulkan no encontró un adaptador GPU compatible ({e:?}); \
+                     reintentando con GLES."
                 );
                 // Clave: soltar la superficie/instancia de Vulkan ANTES de
                 // crear la de GLES. Las dos apuntan al mismo
