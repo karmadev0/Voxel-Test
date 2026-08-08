@@ -34,7 +34,7 @@ var atlas_sampler: sampler;
 // assets/textures/blocks.txt (build.rs arma 1 fila por bloque). Si
 // agregás un bloque a blocks.txt, actualizar ahí Y acá.
 const ATLAS_COLS: f32 = 6.0;
-const ATLAS_ROWS: f32 = 5.0;
+const ATLAS_ROWS: f32 = 7.0;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,

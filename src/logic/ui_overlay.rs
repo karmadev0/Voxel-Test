@@ -650,21 +650,16 @@ pub fn build_debug_panel(
 const JOYSTICK_VISUAL_RADIUS: f64 = 70.0;
 const NUB_VISUAL_RADIUS: f64 = 26.0;
 
-/// Dibuja la hotbar de bloques (5 slots, resaltando el seleccionado con un
-/// borde blanco). Independiente de touch: solo depende del tamaño de
-/// pantalla y del bloque seleccionado, así que la usan tanto el overlay
-/// táctil de Android (`build_touch_overlay`) como el HUD de escritorio
-/// (ver `lib.rs`, rama `not(target_os = "android")` de `GameScreen::Playing`).
+/// Dibuja la hotbar de bloques (`BlockType::HOTBAR_SLOTS` slots,
+/// resaltando el seleccionado con un borde blanco). Independiente de
+/// touch: solo depende del tamaño de pantalla y del bloque seleccionado,
+/// así que la usan tanto el overlay táctil de Android
+/// (`build_touch_overlay`) como el HUD de escritorio (ver `lib.rs`, rama
+/// `not(target_os = "android")` de `GameScreen::Playing`).
 pub fn build_hotbar(size: PhysicalSize<u32>, selected_block: BlockType) -> Vec<UiVertex> {
-    let mut verts = Vec::with_capacity(60);
-    for i in 1..=5u8 {
-        let block = match i {
-            1 => BlockType::Grass,
-            2 => BlockType::Dirt,
-            3 => BlockType::Stone,
-            4 => BlockType::Wood,
-            _ => BlockType::Leaves,
-        };
+    let mut verts = Vec::with_capacity(BlockType::HOTBAR_SLOTS as usize * 12);
+    for i in 1..=BlockType::HOTBAR_SLOTS {
+        let block = BlockType::from_hotbar_slot(i);
         let [r, g, b] = block.color();
         let rect = TouchController::rect_hotbar(size, i);
         let is_selected = block == selected_block;

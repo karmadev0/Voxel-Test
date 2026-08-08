@@ -19,6 +19,21 @@ use noise::{NoiseFn, Perlin};
 /// ese radio.
 const TREE_MARGIN: i32 = 2;
 
+/// A qué altura el mundo se considera "bajo el mar": toda columna cuyo
+/// terreno (`height_at`) quede por debajo de esto se inunda desde ahí
+/// hasta acá con agua fuente — así aparecen lagos/mares en los valles,
+/// sin tocar el resto del mapa (que queda por encima, seco). Con
+/// min_height=8 y max_height≈60 (ver `height_at`), 16 inunda una
+/// franja angosta de los valles más bajos, no la mitad del mapa.
+const SEA_LEVEL: usize = 16;
+
+/// Por debajo de esta altura absoluta, cualquier hueco de cueva (ver
+/// `is_cave`) se genera lleno de agua en vez de aire — lagos
+/// subterráneos, como los acuíferos de Minecraft. Deliberadamente más
+/// bajo que `SEA_LEVEL` para que la mayoría de las cuevas exploradas
+/// sigan secas; solo las más profundas se inundan.
+const CAVE_WATER_LEVEL: i32 = 10;
+
 pub struct WorldGenerator {
     noise: Perlin,
     /// Ruido 3D aparte para las cuevas (semilla derivada, no la misma
@@ -76,6 +91,14 @@ impl WorldGenerator {
                     // exactamente lo que hace falta para que quede
                     // hueco.
                     if self.is_cave(world_x, y as i32, world_z, height) {
+                        // Cuevas profundas: en vez de dejar el hueco
+                        // vacío, lo generamos ya inundado (lago
+                        // subterráneo). No hace falta simulación para
+                        // esto — nace así, completo, igual que el mar
+                        // de superficie más abajo.
+                        if (y as i32) <= CAVE_WATER_LEVEL {
+                            chunk.set(local_x, y, local_z, BlockType::Water(0));
+                        }
                         continue;
                     }
 
@@ -88,6 +111,15 @@ impl WorldGenerator {
                     };
 
                     chunk.set(local_x, y, local_z, block);
+                }
+
+                // Mar/lago de superficie: si el terreno de esta columna
+                // queda por debajo del nivel del mar, se rellena con
+                // agua fuente desde la superficie hasta `SEA_LEVEL`.
+                if height < SEA_LEVEL {
+                    for y in height..SEA_LEVEL.min(CHUNK_SIZE_Y) {
+                        chunk.set(local_x, y, local_z, BlockType::Water(0));
+                    }
                 }
             }
         }
@@ -121,6 +153,9 @@ impl WorldGenerator {
         let height = self.height_at(wx, wz);
         if height == 0 || height >= CHUNK_SIZE_Y {
             return None; // sin superficie válida, o ya toca el techo del mundo
+        }
+        if height <= SEA_LEVEL {
+            return None; // bajo el agua (ver SEA_LEVEL): nada de árboles ahogados
         }
 
         // La superficie de toda columna hoy es siempre Grass (ver el loop
@@ -218,26 +253,38 @@ impl WorldGenerator {
     /// bajan (cuevas grandes e interconectadas) y en otras suben
     /// (bolsones chicos y sueltos, o casi nada).
     ///
-    /// Las salidas a la superficie NO dependen de que este ruido
-    /// "por casualidad" llegue arriba (con eso nunca coincidía, quedaba
-    /// todo sellado) — ver `entrance_shaft` más abajo, que garantiza un
-    /// pozo real en zonas raras y esparcidas.
+    /// Las salidas a la superficie tienen dos fuentes distintas: un
+    /// barranco raro y garantizado (`ravine`), y zonas donde se le
+    /// permite a esta misma cueva orgánica llegar más cerca del techo
+    /// (`entrance_zone`) — sin forzar nada, la boca solo aparece si la
+    /// forma de la cueva de verdad llega hasta ahí.
     fn is_cave(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
         const FLOOR_BUFFER: i32 = 2;
-        const SURFACE_BUFFER: i32 = 4;
-        let ceiling = surface_height as i32 - SURFACE_BUFFER;
         if wy < FLOOR_BUFFER {
             return false;
         }
 
-        // Pozo de entrada: garantizado, no depende de coincidir con una
-        // cueva. Ver `entrance_shaft`.
-        if self.entrance_shaft(wx, wy, wz, surface_height) {
+        // Barranco: grieta abierta de verdad, de punta a punta, sin
+        // techo — pero la EXCEPCIÓN, no la regla (ver `ravine`, umbral
+        // alto a propósito). Antes esto mismo pasaba en casi todos
+        // lados porque el pozo se tallaba entero sin importar si abajo
+        // había una cueva real — literal falla de San Andrés en cada
+        // entrada. Ahora es raro, como los barrancos de Minecraft.
+        if self.ravine(wx, wy, wz, surface_height) {
             return true;
         }
 
+        // Zona de "boca de cueva" natural: a diferencia del barranco de
+        // arriba, esto NO fuerza nada — solo le baja el colchón a la
+        // cueva normal (queso/túnel, más abajo) para que, SI de verdad
+        // pasa cerca de la superficie en esta zona, pueda asomar. Si la
+        // cueva no llega hasta ahí, sigue sellada igual que en el resto
+        // del mapa. Así la boca queda con la forma orgánica de la cueva
+        // (angosta, irregular) en vez de un agujero geométrico forzado.
+        let surface_buffer = if self.entrance_zone(wx, wz) { 1 } else { 4 };
+        let ceiling = surface_height as i32 - surface_buffer;
         if wy > ceiling {
-            return false; // fuera del pozo de entrada, sellado como siempre
+            return false;
         }
 
         let region_bias = self
@@ -294,31 +341,40 @@ impl WorldGenerator {
         is_cheese || is_tunnel
     }
 
-    /// Pozo de entrada garantizado: en parches raros y esparcidos
-    /// (definidos por `entrance_bias`, ruido 2D de frecuencia baja —
-    /// las manchas irregulares que forma son directamente la silueta
-    /// del pozo, nada de círculo perfecto) queda un hueco real desde
-    /// bien abajo hasta la superficie. A diferencia de esperar que
-    /// `is_cave` coincida "por casualidad" cerca del techo (que en la
-    /// práctica casi nunca pasaba), esto asegura que sí haya por dónde
-    /// entrar caminando.
-    fn entrance_shaft(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
-        const ENTRANCE_FREQ: f64 = 0.035;
-        const ENTRANCE_THRESHOLD: f64 = 0.42;
-        // Cuánto baja el pozo por debajo de la superficie: suficiente
-        // para que casi siempre termine conectando con alguna caverna
-        // o túnel de más abajo en vez de quedar un pozo ciego.
-        const SHAFT_DEPTH: i32 = 20;
+    /// Barranco: grieta abierta de verdad, garantizada, de punta a
+    /// punta — pero rara (`RAVINE_THRESHOLD` alto), la excepción entre
+    /// las cuevas normales y no la norma. Mismo espíritu que los
+    /// ravines de Minecraft: se ven de tanto en tanto explorando, no en
+    /// cada loma.
+    fn ravine(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
+        const RAVINE_FREQ: f64 = 0.05;
+        const RAVINE_THRESHOLD: f64 = 0.8;
+        const RAVINE_DEPTH: i32 = 20;
 
-        let entrance_bias = self
+        let bias = self
             .noise
-            .get([wx as f64 * ENTRANCE_FREQ + 40_000.0, wz as f64 * ENTRANCE_FREQ + 40_000.0]);
-        if entrance_bias <= ENTRANCE_THRESHOLD {
+            .get([wx as f64 * RAVINE_FREQ + 80_000.0, wz as f64 * RAVINE_FREQ + 80_000.0]);
+        if bias <= RAVINE_THRESHOLD {
             return false;
         }
 
-        let shaft_bottom = (surface_height as i32 - SHAFT_DEPTH).max(2);
-        wy >= shaft_bottom
+        let bottom = (surface_height as i32 - RAVINE_DEPTH).max(2);
+        wy >= bottom
+    }
+
+    /// ¿(wx, wz) cae dentro de una zona rara y esparcida donde se le
+    /// permite a una cueva normal (queso/túnel) llegar más cerca de la
+    /// superficie que en el resto del mapa? Ojo: esto NO decide por sí
+    /// solo si hay una boca de cueva — solo baja el colchón en
+    /// `is_cave`. Que la boca aparezca de verdad depende de que la
+    /// cueva orgánica realmente pase por ahí cerca del techo.
+    fn entrance_zone(&self, wx: i32, wz: i32) -> bool {
+        const ENTRANCE_FREQ: f64 = 0.015;
+        const ENTRANCE_THRESHOLD: f64 = 0.55;
+        let bias = self
+            .noise
+            .get([wx as f64 * ENTRANCE_FREQ + 40_000.0, wz as f64 * ENTRANCE_FREQ + 40_000.0]);
+        bias > ENTRANCE_THRESHOLD
     }
 
     /// Combina varias octavas de ruido para un terreno con colinas suaves

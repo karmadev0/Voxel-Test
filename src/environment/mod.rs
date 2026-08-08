@@ -3,6 +3,7 @@
 /// mallado (greedy meshing), nubes y color de ambiente/niebla.
 pub mod chunk;
 pub mod clouds;
+pub mod fluids;
 pub mod mesher;
 pub mod save_manager;
 pub mod sky;

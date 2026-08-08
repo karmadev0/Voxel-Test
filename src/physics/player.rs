@@ -164,7 +164,7 @@ impl Player {
         for x in min_x..=max_x {
             for y in min_y..=max_y {
                 for z in min_z..=max_z {
-                    if world.get_block(x, y, z).is_solid() {
+                    if world.get_block(x, y, z).is_collidable() {
                         return true;
                     }
                 }
@@ -191,7 +191,7 @@ impl Player {
 
         for x in min_x..=max_x {
             for z in min_z..=max_z {
-                if world.get_block(x, y, z).is_solid() {
+                if world.get_block(x, y, z).is_collidable() {
                     return true;
                 }
             }
@@ -290,7 +290,7 @@ impl Player {
                     if self.collides_at(world, candidate) {
                         continue;
                     }
-                    if require_floor && !world.get_block(bx, by - 1, bz).is_solid() {
+                    if require_floor && !world.get_block(bx, by - 1, bz).is_collidable() {
                         continue;
                     }
                     return Some(candidate);

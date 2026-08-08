@@ -413,6 +413,18 @@ struct State {
     /// frame en que se entra a `Saving` y la pantalla nunca llegaría a
     /// pintarse antes del bloqueo.
     saving_started: bool,
+
+    /// Simulación de agua/esponja (ver `environment/fluids.rs`). No se
+    /// persiste al guardar: es solo una cola de "qué revisar en el
+    /// próximo tick", y toda esa información se reconstruye sola en
+    /// cuanto el jugador vuelve a tocar agua (romper/colocar bloques,
+    /// ver `handle_click`) — no hace falta que sobreviva a un
+    /// guardado/carga.
+    fluids: environment::fluids::FluidSim,
+    /// Último tick de la simulación de fluidos (mismo patrón que
+    /// `last_autosave`, pero con un intervalo fijo y bastante más
+    /// corto: ver `FLUID_TICK_MS` en `update()`).
+    last_fluid_tick: Instant,
 }
 
 impl State {
@@ -478,6 +490,8 @@ impl State {
             autosave_interval_secs: DEFAULT_AUTOSAVE_SECS,
             last_autosave: Instant::now(),
             saving_started: false,
+            fluids: environment::fluids::FluidSim::new(),
+            last_fluid_tick: Instant::now(),
         }
     }
 
@@ -750,6 +764,8 @@ impl State {
             autosave_interval_secs: session.autosave_interval_secs,
             last_autosave: Instant::now(),
             saving_started: false,
+            fluids: environment::fluids::FluidSim::new(),
+            last_fluid_tick: Instant::now(),
         }
     }
 
@@ -800,7 +816,10 @@ impl State {
         let dirty = match button {
             MouseButton::Left => {
                 let (x, y, z) = hit.block_pos;
-                self.world.set_block(x, y, z, BlockType::Air)
+                let old = self.world.get_block(x, y, z);
+                let dirty = self.world.set_block(x, y, z, BlockType::Air);
+                self.fluids.notify_block_changed((x, y, z), old, BlockType::Air);
+                dirty
             }
             MouseButton::Right => {
                 let (x, y, z) = hit.place_pos;
@@ -819,7 +838,10 @@ impl State {
                     );
                     return;
                 }
-                self.world.set_block(x, y, z, self.selected_block)
+                let old = self.world.get_block(x, y, z);
+                let dirty = self.world.set_block(x, y, z, self.selected_block);
+                self.fluids.notify_block_changed((x, y, z), old, self.selected_block);
+                dirty
             }
             _ => return,
         };
@@ -910,13 +932,7 @@ impl State {
         match action {
             TouchAction::Place => self.handle_click(MouseButton::Right),
             TouchAction::SelectBlock(n) => {
-                self.selected_block = match n {
-                    1 => BlockType::Grass,
-                    2 => BlockType::Dirt,
-                    3 => BlockType::Stone,
-                    4 => BlockType::Wood,
-                    _ => BlockType::Leaves,
-                };
+                self.selected_block = BlockType::from_hotbar_slot(n);
             }
             TouchAction::PlayGame => {
                 // "JUGAR" ya no entra directo: abre la lista de mundos
@@ -1568,6 +1584,26 @@ impl State {
             // "atrapado".
             if self.game_mode.auto_rescue() {
                 self.maybe_rescue_player();
+            }
+        }
+
+        // Simulación de agua/esponja (ver environment/fluids.rs). Tick
+        // corto y fijo (no configurable como el autoguardado): a
+        // diferencia de ese, achicar este intervalo no tiene costo de
+        // guardar nada a disco, así que no hace falta dejarlo en manos
+        // del jugador — 150ms da un esparcido/secado que se nota fluido
+        // sin recalcular en cada frame.
+        const FLUID_TICK_MS: u128 = 150;
+        if self.last_fluid_tick.elapsed().as_millis() >= FLUID_TICK_MS {
+            self.last_fluid_tick = Instant::now();
+            let dirty = self.fluids.tick(&mut self.world);
+            // Un tick ocupado puede tocar el mismo chunk muchas veces
+            // (`remesh_chunk` rehace el mesh entero, no es gratis);
+            // deduplicamos antes de remallear en vez de una vez por
+            // bloque cambiado.
+            let unique: std::collections::HashSet<(i32, i32)> = dirty.into_iter().collect();
+            for (cx, cz) in unique {
+                self.remesh_chunk(cx, cz);
             }
         }
 
@@ -2655,16 +2691,21 @@ impl ApplicationHandler for App {
                                     | winit::keyboard::KeyCode::Digit3
                                     | winit::keyboard::KeyCode::Digit4
                                     | winit::keyboard::KeyCode::Digit5
+                                    | winit::keyboard::KeyCode::Digit6
+                                    | winit::keyboard::KeyCode::Digit7
                             )
                         {
                             // Selección de bloque para colocar (hotbar simple).
-                            state.selected_block = match code {
-                                winit::keyboard::KeyCode::Digit1 => BlockType::Grass,
-                                winit::keyboard::KeyCode::Digit2 => BlockType::Dirt,
-                                winit::keyboard::KeyCode::Digit3 => BlockType::Stone,
-                                winit::keyboard::KeyCode::Digit4 => BlockType::Wood,
-                                _ => BlockType::Leaves,
+                            let slot = match code {
+                                winit::keyboard::KeyCode::Digit1 => 1,
+                                winit::keyboard::KeyCode::Digit2 => 2,
+                                winit::keyboard::KeyCode::Digit3 => 3,
+                                winit::keyboard::KeyCode::Digit4 => 4,
+                                winit::keyboard::KeyCode::Digit5 => 5,
+                                winit::keyboard::KeyCode::Digit6 => 6,
+                                _ => 7,
                             };
+                            state.selected_block = BlockType::from_hotbar_slot(slot);
                         } else {
                             state.camera.process_key(code, event.state);
                         }

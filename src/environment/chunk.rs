@@ -19,6 +19,24 @@ pub enum BlockType {
     Stone,
     Wood,
     Leaves,
+    // A partir de acá: SIEMPRE agregar variantes nuevas al final. El
+    // guardado de chunks usa bincode, que serializa el enum por el
+    // índice de la variante (0, 1, 2...) — insertar algo en el medio
+    // corrompería silenciosamente todos los mundos guardados con la
+    // versión anterior (un `Stone` guardado podría leerse como otra
+    // cosa después de la migración).
+    //
+    /// Agua que fluye: `0` = manantial/fuente (nunca se seca sola, solo
+    /// si la rompe el jugador o la absorbe una esponja cercana).
+    /// `1..=6` = agua que llegó fluyendo desde una fuente, más lejos =
+    /// número más alto; si en algún momento deja de tener un vecino
+    /// con nivel menor (o una fuente) alimentándola, se seca sola (ver
+    /// `environment/fluids.rs`).
+    Water(u8),
+    /// Absorbe el agua de los alrededores de a poco (ver
+    /// `environment/fluids.rs`), igual que en Minecraft. Bloque sólido
+    /// normal en todo lo demás.
+    Sponge,
 }
 
 impl BlockType {
@@ -32,14 +50,32 @@ impl BlockType {
             BlockType::Stone => [0.5, 0.5, 0.52],
             BlockType::Wood => [0.42, 0.30, 0.18],
             BlockType::Leaves => [0.27, 0.42, 0.20],
+            BlockType::Water(_) => [0.2, 0.39, 0.82],
+            BlockType::Sponge => [0.78, 0.74, 0.26],
         }
     }
 
     /// `Leaves` queda sólida por simplicidad, igual que el resto de los
     /// bloques del engine hoy (no hay transparencia/alpha-blend en el
-    /// mesher todavía).
+    /// mesher todavía). Esto es a propósito TAMBIÉN el criterio que usa
+    /// el mesher para decidir si dibuja una cara (ver
+    /// `mesher::greedy_sweep`): cualquier cosa que no sea `Air` se
+    /// considera "opaca" a los efectos del dibujado — incluida el agua,
+    /// que sí se ve aunque el jugador pueda atravesarla nadando (ver
+    /// `is_collidable`, que es la que de verdad importa para colisión
+    /// física).
     pub fn is_solid(&self) -> bool {
         !matches!(self, BlockType::Air)
+    }
+
+    /// Para colisión física (`physics/player.rs`) y raycasting
+    /// (`environment/world.rs::raycast`): a diferencia de `is_solid`
+    /// (que el mesher usa solo para decidir "aire vs. no aire" al
+    /// dibujar caras), acá el agua NO cuenta como sólida — el jugador
+    /// puede caminar/nadar a través suyo. La esponja sí es sólida
+    /// (se puede pisar).
+    pub fn is_collidable(&self) -> bool {
+        !matches!(self, BlockType::Air | BlockType::Water(_))
     }
 
     /// Nombre en mayúsculas para mostrar en overlays de texto (panel de
@@ -53,6 +89,31 @@ impl BlockType {
             BlockType::Stone => "PIEDRA",
             BlockType::Wood => "MADERA",
             BlockType::Leaves => "HOJAS",
+            BlockType::Water(_) => "AGUA",
+            BlockType::Sponge => "ESPONJA",
+        }
+    }
+
+    /// Cantidad de slots de la hotbar (ver `logic/touch.rs::rect_hotbar`
+    /// y `logic/ui_overlay.rs::build_hotbar`) — único lugar donde vive
+    /// este número, para que ningún llamador se desincronice del resto.
+    pub const HOTBAR_SLOTS: u8 = 7;
+
+    /// Bloque que corresponde al slot `n` (1..=HOTBAR_SLOTS) de la
+    /// hotbar. Único lugar donde vive este mapeo — antes estaba
+    /// duplicado a mano en tres puntos distintos (dibujado, tap táctil
+    /// y teclado 1-7), lo que es una receta para que se desincronicen.
+    /// Colocar `Water` desde acá siempre pone una fuente (`Water(0)`):
+    /// el jugador nunca coloca agua "a medio secar".
+    pub fn from_hotbar_slot(n: u8) -> BlockType {
+        match n {
+            1 => BlockType::Grass,
+            2 => BlockType::Dirt,
+            3 => BlockType::Stone,
+            4 => BlockType::Wood,
+            5 => BlockType::Leaves,
+            6 => BlockType::Water(0),
+            _ => BlockType::Sponge,
         }
     }
 }

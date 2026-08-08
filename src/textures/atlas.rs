@@ -20,8 +20,9 @@ use crate::environment::chunk::BlockType;
 
 pub const ATLAS_COLS: u32 = 6;
 // Debe coincidir con la cantidad de líneas (no vacías) de
-// assets/textures/blocks.txt. Hoy: stone, dirt, grass, wood, leaves.
-pub const ATLAS_ROWS: u32 = 5;
+// assets/textures/blocks.txt. Hoy: stone, dirt, grass, wood, leaves,
+// water, sponge.
+pub const ATLAS_ROWS: u32 = 7;
 pub const TILE_PX: u32 = 16;
 
 /// Cara de un quad en términos de textura, ahora con soporte real para
@@ -90,6 +91,8 @@ const ROW_DIRT: u32 = 1;
 const ROW_GRASS: u32 = 2;
 const ROW_WOOD: u32 = 3;
 const ROW_LEAVES: u32 = 4;
+const ROW_WATER: u32 = 5;
+const ROW_SPONGE: u32 = 6;
 
 /// Orden de columnas que usa build.rs al volcar los 6 PNG sueltos de un
 /// bloque (<bloque>_top.png ... <bloque>_west.png) en una fila del atlas.
@@ -130,6 +133,8 @@ pub fn tile_for(block: BlockType, face: Face) -> (u32, u32) {
         BlockType::Grass => tile_for_row(ROW_GRASS, face),
         BlockType::Wood => tile_for_row(ROW_WOOD, face),
         BlockType::Leaves => tile_for_row(ROW_LEAVES, face),
+        BlockType::Water(_) => tile_for_row(ROW_WATER, face),
+        BlockType::Sponge => tile_for_row(ROW_SPONGE, face),
         BlockType::Air => tile_for_row(ROW_STONE, face),
     }
 }

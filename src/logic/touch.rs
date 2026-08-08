@@ -250,7 +250,8 @@ impl TouchController {
     }
 
     pub(crate) fn rect_hotbar(size: PhysicalSize<u32>, index: u8) -> (f64, f64, f64, f64) {
-        let total_w = HOTBAR_SIZE * 5.0 + HOTBAR_GAP * 4.0;
+        let slots = crate::environment::chunk::BlockType::HOTBAR_SLOTS as f64;
+        let total_w = HOTBAR_SIZE * slots + HOTBAR_GAP * (slots - 1.0);
         let start_x = size.width as f64 * 0.5 - total_w * 0.5;
         let x = start_x + (index - 1) as f64 * (HOTBAR_SIZE + HOTBAR_GAP);
         let y = size.height as f64 - MARGIN - HOTBAR_SIZE;
@@ -652,7 +653,7 @@ impl TouchController {
                     self.crouch_held = false;
                     return Some(TouchAction::OpenPause);
                 }
-                for i in 1..=5u8 {
+                for i in 1..=crate::environment::chunk::BlockType::HOTBAR_SLOTS {
                     if Self::point_in_rect(pos, Self::rect_hotbar(size, i)) {
                         return Some(TouchAction::SelectBlock(i));
                     }

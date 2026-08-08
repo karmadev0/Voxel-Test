@@ -3,3 +3,5 @@ dirt
 grass
 wood
 leaves
+water
+sponge
