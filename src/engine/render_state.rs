@@ -110,17 +110,78 @@ impl RenderState {
         // roto o ausente aunque el chip lo soporte en teoría, así que si
         // Vulkan no encuentra adaptador compatible, caemos a GLES en vez
         // de crashear directo.
+        //
+        // En desktop hay una vuelta extra: wgpu-core 0.19.x tiene un bug
+        // conocido (gfx-rs/wgpu#5225, #5272, #6165, #5294 — todos con el
+        // mismo stacktrace) donde, si `create_surface` no logra conectar
+        // el backend pedido con la ventana (típico en sesiones Wayland
+        // donde el EGL de wgpu-hal no queda bien enchufado), en vez de
+        // devolver un `CreateSurfaceError` prolijo hace un panic interno
+        // ("called `Option::unwrap()` on a `None` value" en
+        // wgpu-core/src/instance.rs:521). Como el panic pasa DENTRO de la
+        // librería, no llega ni a devolver un `Result` que podamos
+        // matchear: hay que envolver la llamada en `catch_unwind` y, si
+        // explota, reintentar dejando que wgpu elija entre todos los
+        // backends disponibles en el sistema en vez de forzar uno solo.
         #[cfg(not(target_os = "android"))]
-        let backends = wgpu::Backends::GL;
+        let (instance, surface) = {
+            let gl_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let gl_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::GL,
+                    ..Default::default()
+                });
+                let gl_surface = gl_instance.create_surface(window.clone());
+                (gl_instance, gl_surface)
+            }));
+
+            match gl_attempt {
+                Ok((gl_instance, Ok(gl_surface))) => (gl_instance, gl_surface),
+                other => {
+                    match &other {
+                        Ok((_, Err(e))) => log::warn!(
+                            "No se pudo crear la superficie con GL forzado ({e:?}); \
+                             reintentando dejando que wgpu elija el backend."
+                        ),
+                        Err(_) => log::warn!(
+                            "wgpu-core panicó creando la superficie con GL forzado \
+                             (bug conocido de wgpu 0.19 en algunos setups Wayland/EGL); \
+                             reintentando dejando que wgpu elija el backend."
+                        ),
+                        _ => {}
+                    }
+
+                    // Soltamos la instancia/superficie de GL que falló
+                    // antes de crear la siguiente, mismo motivo que en la
+                    // rama Android más abajo: si la anterior sigue
+                    // conectada a la ventana, la próxima puede fallar por
+                    // "ya conectada" en vez de darnos un error limpio.
+                    drop(other);
+
+                    let fallback_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                        backends: wgpu::Backends::PRIMARY,
+                        ..Default::default()
+                    });
+                    let fallback_surface = fallback_instance
+                        .create_surface(window.clone())
+                        .expect(
+                            "No se pudo crear una superficie de render con ningún backend \
+                             de wgpu (ni GL forzado ni el resto disponible en el sistema). \
+                             Revisá los drivers Mesa/Vulkan; si estás en Wayland probá \
+                             forzar X11 con la variable de entorno WINIT_UNIX_BACKEND=x11.",
+                        );
+                    (fallback_instance, fallback_surface)
+                }
+            }
+        };
         #[cfg(target_os = "android")]
-        let backends = wgpu::Backends::VULKAN;
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
-
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let (instance, surface) = {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..Default::default()
+            });
+            let surface = instance.create_surface(window.clone()).unwrap();
+            (instance, surface)
+        };
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -168,7 +229,8 @@ impl RenderState {
 
         #[cfg(not(target_os = "android"))]
         let adapter = adapter.expect(
-            "No se encontró un adaptador GPU compatible con el backend GL. Verificá los drivers Mesa.",
+            "No se encontró ningún adaptador GPU compatible (ni con GL forzado ni con \
+             el resto de backends disponibles). Verificá los drivers Mesa/Vulkan.",
         );
 
         log::info!("Adapter: {:?}", adapter.get_info());
