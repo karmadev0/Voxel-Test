@@ -871,6 +871,7 @@ impl State {
         self.apply_menu_action_inner(action, event_loop);
         let is_nameworld = self.game_screen == GameScreen::NameWorld;
         if was_nameworld != is_nameworld {
+            log::info!("set_ime_allowed({is_nameworld}) (entrando/saliendo de NameWorld)");
             window.set_ime_allowed(is_nameworld);
             if is_nameworld {
                 // Ancla el popup del IME (candidatos/predicción, o el
@@ -1693,6 +1694,14 @@ impl State {
                     self.selected_block,
                     self.show_fps,
                 ));
+                // En desktop no hay joystick/botones táctiles, pero la
+                // hotbar (con el borde blanco del bloque seleccionado con
+                // 1-5) es igual de útil con teclado — ver build_hotbar en
+                // ui_overlay.rs, factorizada de build_touch_overlay para
+                // poder reusarla acá sin arrastrar el resto del overlay
+                // táctil.
+                #[cfg(not(target_os = "android"))]
+                verts.extend(ui_overlay::build_hotbar(self.render.size, self.selected_block));
                 // Contador de FPS en la esquina superior derecha.
                 if self.show_fps {
                     verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.render.size));
@@ -2478,6 +2487,7 @@ impl ApplicationHandler for App {
                     // del SO en desktop), habilitado solo mientras
                     // `GameScreen::NameWorld` está en pantalla (ver el
                     // toggle en `apply_menu_action`).
+                    log::info!("Ime event recibido: {:?} (game_screen={:?})", ime_event, state.game_screen);
                     if state.game_screen == GameScreen::NameWorld {
                         match ime_event {
                             winit::event::Ime::Preedit(text, _cursor_range) => {
