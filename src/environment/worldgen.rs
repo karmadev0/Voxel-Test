@@ -21,6 +21,12 @@ const TREE_MARGIN: i32 = 2;
 
 pub struct WorldGenerator {
     noise: Perlin,
+    /// Ruido 3D aparte para las cuevas (semilla derivada, no la misma
+    /// instancia que `noise`): si usáramos el mismo campo que la altura,
+    /// las cuevas quedarían correlacionadas con la forma del terreno de
+    /// superficie (cuevas más probables donde hay colinas, por ejemplo),
+    /// que no es lo que queremos.
+    cave_noise: Perlin,
     seed: u32,
 }
 
@@ -35,6 +41,11 @@ impl WorldGenerator {
     pub fn new(seed: u32) -> Self {
         Self {
             noise: Perlin::new(seed),
+            // XOR con una constante arbitraria: misma técnica que ya usa
+            // `tree_at` para el segundo hash de altura de tronco (ver
+            // `h2`), para derivar un campo de ruido "independiente" del
+            // principal sin tener que manejar dos semillas por separado.
+            cave_noise: Perlin::new(seed ^ 0xCAFE_F00D),
             seed,
         }
     }
@@ -59,6 +70,17 @@ impl WorldGenerator {
                     } else {
                         BlockType::Stone
                     };
+
+                    // Cuevas: solo tallamos dentro de la piedra (no
+                    // debajo del pasto/tierra, ver `is_cave` para el
+                    // colchón bajo la superficie). El chunk arranca
+                    // todo `Air` (`Chunk::empty()`), así que "no poner
+                    // nada" es exactamente lo que hace falta para que
+                    // quede hueco.
+                    if block == BlockType::Stone && self.is_cave(world_x, y as i32, world_z, height) {
+                        continue;
+                    }
+
                     chunk.set(local_x, y, local_z, block);
                 }
             }
@@ -166,6 +188,54 @@ impl WorldGenerator {
         for &(dx, dy, dz) in CANOPY_OFFSETS {
             place(dx, top_y + dy, dz, BlockType::Leaves);
         }
+    }
+
+    /// ¿El bloque de mundo (wx, wy, wz) cae dentro de una cueva? Función
+    /// pura (mismo espíritu que `tree_at`): solo depende de `wx/wy/wz`
+    /// y de `cave_noise`, nunca del chunk que la evalúa ni del orden —
+    /// así dos chunks vecinos (generados en threads/orden distintos)
+    /// siempre concuerdan en dónde está el hueco de una cueva que cruza
+    /// el borde entre los dos.
+    fn is_cave(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
+        // Colchón sólido bajo el pasto/tierra (para que no se abran
+        // agujeros pegados a la superficie) y sobre el piso del mundo
+        // (para que no queden cuevas sin fondo, aunque hoy no hay caída
+        // infinita implementada igual).
+        const SURFACE_BUFFER: i32 = 4;
+        const FLOOR_BUFFER: i32 = 2;
+        let ceiling = surface_height as i32 - SURFACE_BUFFER;
+        if wy < FLOOR_BUFFER || wy > ceiling {
+            return false;
+        }
+
+        // Dos octavas de ruido 3D, una gruesa (forma general de la
+        // caverna) y una fina (paredes irregulares en vez de burbuja
+        // lisa). El eje Y con más frecuencia que X/Z aplasta un poco
+        // las cuevas verticalmente, para que se sientan más "túnel
+        // horizontal" que "esfera flotando" — mismo truco que ya usa
+        // `height_at` con base/detail, aplicado en 3D.
+        let base_freq = 0.045;
+        let detail_freq = 0.12;
+
+        let base = self.cave_noise.get([
+            wx as f64 * base_freq,
+            wy as f64 * base_freq * 1.6,
+            wz as f64 * base_freq,
+        ]);
+        let detail = self.cave_noise.get([
+            wx as f64 * detail_freq + 500.0,
+            wy as f64 * detail_freq * 1.6 + 500.0,
+            wz as f64 * detail_freq + 500.0,
+        ]);
+
+        let combined = base * 0.75 + detail * 0.25;
+
+        // Umbral alto: el ruido Perlin 3D pasa la mayor parte del
+        // tiempo cerca de 0, así que "> 0.6" deja cavernas esparcidas y
+        // razonablemente huecas en vez de comerse toda la piedra. Bajar
+        // este número da cuevas más grandes/frecuentes.
+        const CAVE_THRESHOLD: f64 = 0.62;
+        combined > CAVE_THRESHOLD
     }
 
     /// Combina varias octavas de ruido para un terreno con colinas suaves
