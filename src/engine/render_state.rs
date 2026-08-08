@@ -339,6 +339,7 @@ impl RenderState {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -348,6 +349,7 @@ impl RenderState {
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -367,6 +369,7 @@ impl RenderState {
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
 
         // --- Pipeline del overlay 2D: mira central (ambas plataformas) +
@@ -392,6 +395,7 @@ impl RenderState {
                     module: &ui_shader,
                     entry_point: "vs_main",
                     buffers: &[ui_overlay::UiVertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &ui_shader,
@@ -404,6 +408,7 @@ impl RenderState {
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -436,6 +441,7 @@ impl RenderState {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
+                cache: None,
             })
         };
 
@@ -461,6 +467,7 @@ impl RenderState {
                     module: &highlight_shader,
                     entry_point: "vs_main",
                     buffers: &[highlight::HighlightVertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &highlight_shader,
@@ -470,6 +477,7 @@ impl RenderState {
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::LineList,
@@ -494,6 +502,7 @@ impl RenderState {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
+                cache: None,
             })
         };
 
@@ -521,6 +530,7 @@ impl RenderState {
                     module: &clouds_shader,
                     entry_point: "vs_main",
                     buffers: &[CloudVertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &clouds_shader,
@@ -533,6 +543,7 @@ impl RenderState {
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -559,6 +570,7 @@ impl RenderState {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
+                cache: None,
             })
         };
 

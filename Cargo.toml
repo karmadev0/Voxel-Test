@@ -18,7 +18,7 @@ name = "voxel-engine"
 path = "src/main.rs"
 
 [dependencies]
-wgpu = "0.19"
+wgpu = "29"
 winit = "0.30"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }

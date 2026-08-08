@@ -1434,7 +1434,7 @@ impl State {
         }
 
         self.render.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        self.render.queue.present(output);
 
         Ok(())
     }
@@ -1822,7 +1822,7 @@ impl State {
         }
 
         self.render.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        self.render.queue.present(output);
 
         Ok(())
     }
