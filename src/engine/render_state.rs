@@ -36,6 +36,23 @@ const CLOUD_PLANE_EXTENT: f32 = 3200.0;
 // de las nubes en `clouds_shader.wgsl`; shader.wgsl (terreno) y
 // highlight_shader.wgsl no lo usan, pero como leen un prefijo más corto
 // del mismo buffer no hace falta que lo declaren.
+/// Reemplaza a `wgpu::SurfaceError`, que dejó de existir cuando
+/// `Surface::get_current_texture` pasó a devolver el enum
+/// `CurrentSurfaceTexture` en vez de un `Result`. Solo diferenciamos los
+/// casos que a los callers (`render`/`render_crash_screen` en lib.rs) les
+/// interesa distinguir; el resto de los casos de `CurrentSurfaceTexture`
+/// (timeout, ventana oculta, surface desactualizada) se resuelven solos
+/// adentro de `RenderState::acquire_frame` sin llegar hasta acá.
+#[derive(Debug)]
+pub enum FrameError {
+    /// El dispositivo GPU se perdió (desconexión, reset de driver, etc.).
+    /// Antes se resolvía re-creando la surface; el caller mantiene esa
+    /// reacción.
+    Lost,
+    /// Cualquier otro error de validación al pedir la textura.
+    Other(String),
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
@@ -126,9 +143,12 @@ impl RenderState {
         #[cfg(not(target_os = "android"))]
         let (instance, surface) = {
             let gl_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let gl_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                     backends: wgpu::Backends::GL,
-                    ..Default::default()
+                    flags: wgpu::InstanceFlags::default(),
+                    memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                    backend_options: wgpu::BackendOptions::default(),
+                    display: None,
                 });
                 let gl_surface = gl_instance.create_surface(window.clone());
                 (gl_instance, gl_surface)
@@ -157,9 +177,12 @@ impl RenderState {
                     // "ya conectada" en vez de darnos un error limpio.
                     drop(other);
 
-                    let fallback_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    let fallback_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                         backends: wgpu::Backends::PRIMARY,
-                        ..Default::default()
+                        flags: wgpu::InstanceFlags::default(),
+                        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                        backend_options: wgpu::BackendOptions::default(),
+                        display: None,
                     });
                     let fallback_surface = fallback_instance
                         .create_surface(window.clone())
@@ -175,9 +198,12 @@ impl RenderState {
         };
         #[cfg(target_os = "android")]
         let (instance, surface) = {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::VULKAN,
-                ..Default::default()
+                flags: wgpu::InstanceFlags::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                display: None,
             });
             let surface = instance.create_surface(window.clone()).unwrap();
             (instance, surface)
@@ -208,9 +234,12 @@ impl RenderState {
                 drop(surface);
                 drop(instance);
 
-                let gles_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                let gles_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                     backends: wgpu::Backends::GL,
-                    ..Default::default()
+                    flags: wgpu::InstanceFlags::default(),
+                    memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                    backend_options: wgpu::BackendOptions::default(),
+                    display: None,
                 });
                 let gles_surface = gles_instance.create_surface(window.clone()).unwrap();
                 let gles_adapter = gles_instance
@@ -236,17 +265,17 @@ impl RenderState {
         log::info!("Adapter: {:?}", adapter.get_info());
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    // Límites "downlevel" porque el backend GL en hardware
-                    // integrado no soporta todos los límites de wgpu por defecto.
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("device"),
+                required_features: wgpu::Features::empty(),
+                // Límites "downlevel" porque el backend GL en hardware
+                // integrado no soporta todos los límites de wgpu por defecto.
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .expect("No se pudo crear el device wgpu");
 
@@ -328,8 +357,8 @@ impl RenderState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[&uniform_bind_group_layout, &texture_atlas.bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_bind_group_layout), Some(&texture_atlas.bind_group_layout)],
+            immediate_size: 0,
         });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -337,13 +366,13 @@ impl RenderState {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[Vertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -362,13 +391,13 @@ impl RenderState {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -386,20 +415,20 @@ impl RenderState {
                     // calculadas en CPU (ui_overlay.rs), no hace falta
                     // ninguna matriz ni uniform acá.
                     bind_group_layouts: &[],
-                    push_constant_ranges: &[],
+                    immediate_size: 0,
                 });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("ui_pipeline"),
                 layout: Some(&ui_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &ui_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     buffers: &[ui_overlay::UiVertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &ui_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
                         // Alpha blending normal: el overlay es
@@ -434,13 +463,13 @@ impl RenderState {
                 // vez de directamente omitir depth_stencil).
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -457,21 +486,21 @@ impl RenderState {
             let highlight_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("highlight_pipeline_layout"),
-                    bind_group_layouts: &[&uniform_bind_group_layout],
-                    push_constant_ranges: &[],
+                    bind_group_layouts: &[Some(&uniform_bind_group_layout)],
+                    immediate_size: 0,
                 });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("highlight_pipeline"),
                 layout: Some(&highlight_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &highlight_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     buffers: &[highlight::HighlightVertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &highlight_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -495,13 +524,13 @@ impl RenderState {
                 // después de él si el orden cambiara en algún momento.
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -520,21 +549,21 @@ impl RenderState {
             let clouds_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("clouds_pipeline_layout"),
-                    bind_group_layouts: &[&uniform_bind_group_layout],
-                    push_constant_ranges: &[],
+                    bind_group_layouts: &[Some(&uniform_bind_group_layout)],
+                    immediate_size: 0,
                 });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("clouds_pipeline"),
                 layout: Some(&clouds_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &clouds_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     buffers: &[CloudVertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &clouds_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
                         // Las nubes son translúcidas: se mezclan con lo
@@ -563,13 +592,13 @@ impl RenderState {
                 // nada que se dibuje después.
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -598,6 +627,49 @@ impl RenderState {
             uniform_buffer,
             uniform_bind_group,
             texture_atlas,
+        }
+    }
+
+    /// Pide la próxima textura de la surface para dibujar.
+    ///
+    /// Reemplaza al viejo `surface.get_current_texture()?` con
+    /// `wgpu::SurfaceError`: desde que wgpu cambió `get_current_texture`
+    /// para devolver el enum `CurrentSurfaceTexture` (con casos que ya no
+    /// son "error" en el sentido de antes, como `Timeout`/`Occluded`),
+    /// migramos toda esa lógica acá adentro para no repetirla en cada
+    /// función de `lib.rs` que dibuja un frame (`render` y
+    /// `render_crash_screen`).
+    ///
+    /// Devuelve:
+    /// - `Some(Ok(texture))`: hay algo para dibujar este frame.
+    /// - `Some(Err(_))`: pasó algo que el caller sí necesita reaccionar
+    ///   (dispositivo perdido, error de validación).
+    /// - `None`: no hay nada para dibujar este frame (timeout, ventana
+    ///   oculta, o surface desactualizada — ya la reconfiguramos acá
+    ///   mismo) pero tampoco es un error; el caller simplemente vuelve a
+    ///   intentar en el próximo `RedrawRequested`.
+    pub fn acquire_frame(&mut self) -> Option<Result<wgpu::SurfaceTexture, FrameError>> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => Some(Ok(texture)),
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                // Sigue sirviendo para este frame, pero conviene
+                // reconfigurar antes del próximo para volver a un estado
+                // óptimo (tamaño/formato correctos).
+                self.surface.configure(&self.device, &self.config);
+                Some(Ok(texture))
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                // Nada para dibujar este frame; no es un error real.
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Lost => Some(Err(FrameError::Lost)),
+            wgpu::CurrentSurfaceTexture::Validation => Some(Err(FrameError::Other(
+                "error de validación al pedir la textura de la surface".to_string(),
+            ))),
         }
     }
 

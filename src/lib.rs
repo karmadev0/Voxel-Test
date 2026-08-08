@@ -1385,8 +1385,14 @@ impl State {
     /// Como el engine no tiene pipeline de texto, es la única forma que
     /// tenemos hoy de confirmar "sí, se copió" sin depender de un log
     /// que el usuario no está mirando en ese momento.
-    fn render_crash_screen(&mut self, flash: bool) -> Result<(), wgpu::SurfaceError> {
-        let output = self.render.surface.get_current_texture()?;
+    fn render_crash_screen(&mut self, flash: bool) -> Result<(), engine::render_state::FrameError> {
+        let output = match self.render.acquire_frame() {
+            Some(Ok(texture)) => texture,
+            Some(Err(e)) => return Err(e),
+            // Nada para dibujar este frame (timeout/oculta/desactualizada
+            // — ya reconfigurada adentro de `acquire_frame`); no es error.
+            None => return Ok(()),
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1422,6 +1428,7 @@ impl State {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(color),
                         store: wgpu::StoreOp::Store,
@@ -1430,11 +1437,12 @@ impl State {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
 
         self.render.queue.submit(std::iter::once(encoder.finish()));
-        self.render.queue.present(output);
+        output.present();
 
         Ok(())
     }
@@ -1615,8 +1623,12 @@ impl State {
         self.finalize_ready_chunks();
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.render.surface.get_current_texture()?;
+    fn render(&mut self) -> Result<(), engine::render_state::FrameError> {
+        let output = match self.render.acquire_frame() {
+            Some(Ok(texture)) => texture,
+            Some(Err(e)) => return Err(e),
+            None => return Ok(()),
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1756,6 +1768,7 @@ impl State {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: SKY_COLOR[0] as f64,
@@ -1776,6 +1789,7 @@ impl State {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             render_pass.set_pipeline(&self.render.render_pipeline);
@@ -1822,7 +1836,7 @@ impl State {
         }
 
         self.render.queue.submit(std::iter::once(encoder.finish()));
-        self.render.queue.present(output);
+        output.present();
 
         Ok(())
     }
@@ -2251,8 +2265,9 @@ impl ApplicationHandler for App {
                             .unwrap_or(false);
                         match state.render_crash_screen(flashing) {
                             Ok(_) => {}
-                            Err(wgpu::SurfaceError::Lost) => state.resize(state.render.size),
-                            Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                            Err(engine::render_state::FrameError::Lost) => {
+                                state.resize(state.render.size)
+                            }
                             Err(e) => log::warn!("Error de render (pantalla de crash): {:?}", e),
                         }
                         if let Some(msg) = &self.crash_short_message {
@@ -2599,8 +2614,9 @@ impl ApplicationHandler for App {
                     state.update();
                     match state.render() {
                         Ok(_) => {}
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.render.size),
-                        Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                        Err(engine::render_state::FrameError::Lost) => {
+                            state.resize(state.render.size)
+                        }
                         Err(e) => log::warn!("Error de render: {:?}", e),
                     }
 
