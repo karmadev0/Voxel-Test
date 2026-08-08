@@ -143,7 +143,7 @@ impl RenderState {
         #[cfg(not(target_os = "android"))]
         let (instance, surface) = {
             let gl_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                let gl_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                     backends: wgpu::Backends::GL,
                     flags: wgpu::InstanceFlags::default(),
                     memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -177,7 +177,7 @@ impl RenderState {
                     // "ya conectada" en vez de darnos un error limpio.
                     drop(other);
 
-                    let fallback_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                    let fallback_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                         backends: wgpu::Backends::PRIMARY,
                         flags: wgpu::InstanceFlags::default(),
                         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -198,7 +198,7 @@ impl RenderState {
         };
         #[cfg(target_os = "android")]
         let (instance, surface) = {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::VULKAN,
                 flags: wgpu::InstanceFlags::default(),
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -234,7 +234,7 @@ impl RenderState {
                 drop(surface);
                 drop(instance);
 
-                let gles_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                let gles_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                     backends: wgpu::Backends::GL,
                     flags: wgpu::InstanceFlags::default(),
                     memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
