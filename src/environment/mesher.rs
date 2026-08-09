@@ -16,6 +16,17 @@ use crate::environment::chunk::{BlockType, Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Y, CH
 use crate::textures::atlas;
 use bytemuck::{Pod, Zeroable};
 
+/// Qué tan lleno se ve un bloque de agua según su nivel de flujo (ver
+/// `BlockType::Water` y `environment/fluids.rs`): 0 = fuente (casi
+/// lleno, 8/9), 7 = a punto de secarse (apenas 1/9). Mismos 9 pasos que
+/// usa Minecraft, así el nivel de agua se nota a simple vista en vez de
+/// que todo bloque de agua se vea igual — es lo que hace que el
+/// esparcido/secado gradual del tick de `fluids.rs` se vea de verdad,
+/// no solo que pase "por atrás" sin manifestarse en pantalla.
+fn water_height_frac(level: u8) -> f32 {
+    1.0 - (level as f32 + 1.0) / 9.0
+}
+
 /// Fase 5: antes, el mesh de un chunk solo miraba sus propios bloques —
 /// en el borde con un chunk vecino, ese vecino se trataba siempre como
 /// aire, así que quedaban caras de más dibujadas ahí (invisibles para el
@@ -308,6 +319,25 @@ fn emit_quad(
 
     let to_f = |p: [i32; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
 
+    let mut corners = [to_f(p0), to_f(p1), to_f(p2), to_f(p3)];
+
+    // Solo la cara de ARRIBA (axis=1, no backface: el agua mirando hacia
+    // el aire) se achica según el nivel — ver `water_height_frac`. Las
+    // caras laterales y la de abajo quedan a altura completa a
+    // propósito: es mucho más simple que recortarlas también (el greedy
+    // meshing fusiona rectángulos asumiendo bloques de una unidad
+    // completa; tocar eso ahí rompería esa fusión) y el resultado visual
+    // sigue siendo correcto — se ve como un borde/labio parado en la
+    // orilla en vez de un hueco o un corte raro.
+    if axis == 1 && !backface {
+        if let BlockType::Water(level) = block {
+            let y = corners[0][1] - (1.0 - water_height_frac(level));
+            for c in &mut corners {
+                c[1] = y;
+            }
+        }
+    }
+
     // Ancho/alto del quad en bloques, para las UV locales (ver doc de Vertex).
     let quad_w = (du[0].abs() + du[1].abs() + du[2].abs()) as f32;
     let quad_h = (dv[0].abs() + dv[1].abs() + dv[2].abs()) as f32;
@@ -317,7 +347,6 @@ fn emit_quad(
 
     let start_index = vertices.len() as u32;
 
-    let corners = [to_f(p0), to_f(p1), to_f(p2), to_f(p3)];
     // UV de textura (s = horizontal del atlas, t = vertical del atlas),
     // que NO es lo mismo que los ejes de barrido u/v del greedy meshing
     // de arriba (esos son sobre el mundo, elegidos genéricamente como

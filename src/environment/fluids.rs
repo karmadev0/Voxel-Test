@@ -128,13 +128,26 @@ impl FluidSim {
             return Some(0);
         }
 
-        // Si no hay nada cayendo, se esparce horizontalmente desde el
-        // vecino con el nivel más bajo (más "lleno").
+        // Si no hay nada cayendo, se esparce horizontalmente — pero
+        // SOLO desde un vecino que esté "parado" de verdad (con piso
+        // sólido debajo), no desde uno que esté cayendo en tránsito.
+        // Sin este chequeo, cada nivel de una cascada larga también
+        // repartía agua para los costados como si tuviera piso, cuando
+        // en realidad seguía siendo aire abajo — por eso una caída se
+        // veía "esparcida" a los pocos niveles en vez de seguir de
+        // largo hasta el fondo de verdad.
         let neighbors = [(x + 1, y, z), (x - 1, y, z), (x, y, z + 1), (x, y, z - 1)];
         let best = neighbors
             .iter()
-            .filter_map(|&p| match world.get_block(p.0, p.1, p.2) {
-                BlockType::Water(level) => Some(level),
+            .filter_map(|&(nx, ny, nz)| match world.get_block(nx, ny, nz) {
+                BlockType::Water(level) => {
+                    let resting = world.get_block(nx, ny - 1, nz).is_collidable();
+                    if resting {
+                        Some(level)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             })
             .min()?;

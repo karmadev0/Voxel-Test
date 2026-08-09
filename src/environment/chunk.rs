@@ -28,7 +28,7 @@ pub enum BlockType {
     //
     /// Agua que fluye: `0` = manantial/fuente (nunca se seca sola, solo
     /// si la rompe el jugador o la absorbe una esponja cercana).
-    /// `1..=6` = agua que llegó fluyendo desde una fuente, más lejos =
+    /// `1..=7` = agua que llegó fluyendo desde una fuente, más lejos =
     /// número más alto; si en algún momento deja de tener un vecino
     /// con nivel menor (o una fuente) alimentándola, se seca sola (ver
     /// `environment/fluids.rs`).
