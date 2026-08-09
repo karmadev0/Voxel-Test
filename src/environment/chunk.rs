@@ -95,25 +95,37 @@ impl BlockType {
     }
 
     /// Cantidad de slots de la hotbar (ver `logic/touch.rs::rect_hotbar`
-    /// y `logic/ui_overlay.rs::build_hotbar`) — único lugar donde vive
-    /// este número, para que ningún llamador se desincronice del resto.
-    pub const HOTBAR_SLOTS: u8 = 7;
+    /// y `logic/ui_overlay.rs::build_hotbar`) — 9, como en Minecraft.
+    /// Único lugar donde vive este número, para que ningún llamador se
+    /// desincronice del resto. No confundir con `MATERIAL_COUNT`: hoy
+    /// solo hay 7 materiales de verdad, así que los últimos 2 slots
+    /// quedan vacíos/reservados (ver `from_hotbar_slot`).
+    pub const HOTBAR_SLOTS: u8 = 9;
 
-    /// Bloque que corresponde al slot `n` (1..=HOTBAR_SLOTS) de la
-    /// hotbar. Único lugar donde vive este mapeo — antes estaba
-    /// duplicado a mano en tres puntos distintos (dibujado, tap táctil
-    /// y teclado 1-7), lo que es una receta para que se desincronicen.
-    /// Colocar `Water` desde acá siempre pone una fuente (`Water(0)`):
-    /// el jugador nunca coloca agua "a medio secar".
-    pub fn from_hotbar_slot(n: u8) -> BlockType {
+    /// Cuántos materiales reales existen (1..=MATERIAL_COUNT son los que
+    /// `from_hotbar_slot` devuelve `Some`; el resto, hasta
+    /// `HOTBAR_SLOTS`, son slots vacíos reservados para el día que se
+    /// agreguen más bloques).
+    pub const MATERIAL_COUNT: u8 = 7;
+
+    /// Bloque que corresponde al slot `n` (1-based) de la hotbar/
+    /// inventario, o `None` si `n` cae en uno de los slots vacíos
+    /// reservados (`n > MATERIAL_COUNT`). Único lugar donde vive este
+    /// mapeo — antes estaba duplicado a mano en tres puntos distintos
+    /// (dibujado, tap táctil y teclado), lo que es una receta para que
+    /// se desincronicen. Colocar `Water` desde acá siempre pone una
+    /// fuente (`Water(0)`): el jugador nunca coloca agua "a medio
+    /// secar".
+    pub fn from_hotbar_slot(n: u8) -> Option<BlockType> {
         match n {
-            1 => BlockType::Grass,
-            2 => BlockType::Dirt,
-            3 => BlockType::Stone,
-            4 => BlockType::Wood,
-            5 => BlockType::Leaves,
-            6 => BlockType::Water(0),
-            _ => BlockType::Sponge,
+            1 => Some(BlockType::Grass),
+            2 => Some(BlockType::Dirt),
+            3 => Some(BlockType::Stone),
+            4 => Some(BlockType::Wood),
+            5 => Some(BlockType::Leaves),
+            6 => Some(BlockType::Water(0)),
+            7 => Some(BlockType::Sponge),
+            _ => None,
         }
     }
 }

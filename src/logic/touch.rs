@@ -89,6 +89,16 @@ pub enum TouchAction {
     SelectBlock(u8), // 1..=5
     /// El jugador tocó el botón de engranaje → ir al menú de pausa.
     OpenPause,
+    /// Abre el inventario desde el juego (botón "..." en Android — en
+    /// desktop esto es la tecla "E", manejada directo en `lib.rs` sin
+    /// pasar por acá porque ahí también hace falta soltar/capturar el
+    /// mouse, algo que no aplica en Android).
+    OpenInventory,
+    /// Elegir el material del slot `n` (1-based) en la pantalla de
+    /// inventario — selecciona ese material Y cierra el inventario en
+    /// el mismo toque (a diferencia de `SelectBlock`, el tap en la
+    /// hotbar mientras se juega, que no cierra nada).
+    SelectInventorySlot(u8),
     /// "JUGAR" en el menú principal → abrir la lista de mundos
     /// (`GameScreen::WorldList`), no entrar directo a una partida.
     PlayGame,
@@ -263,6 +273,15 @@ impl TouchController {
         let x = start_x + (index - 1) as f64 * (HOTBAR_SIZE + HOTBAR_GAP);
         let y = size.height as f64 - MARGIN - HOTBAR_SIZE;
         (x, y, HOTBAR_SIZE, HOTBAR_SIZE)
+    }
+
+    /// Botón "..." que abre el inventario completo (ver
+    /// `GameScreen::Inventory`) — se dibuja como un slot más, pegado
+    /// justo a la derecha del último slot real de la hotbar, mismo
+    /// tamaño. Es el equivalente táctil de la tecla "E" en desktop.
+    pub(crate) fn rect_inventory_button(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let last = Self::rect_hotbar(size, crate::environment::chunk::BlockType::HOTBAR_SLOTS);
+        (last.0 + last.2 + HOTBAR_GAP, last.1, HOTBAR_SIZE, HOTBAR_SIZE)
     }
 
     /// Botón de configuración: arriba a la derecha.
@@ -716,6 +735,12 @@ impl TouchController {
                     self.crouch_held = false;
                     return Some(TouchAction::OpenPause);
                 }
+                if Self::point_in_rect(pos, Self::rect_inventory_button(size)) {
+                    self.drags.clear();
+                    self.jump_held = false;
+                    self.crouch_held = false;
+                    return Some(TouchAction::OpenInventory);
+                }
                 for i in 1..=crate::environment::chunk::BlockType::HOTBAR_SLOTS {
                     if Self::point_in_rect(pos, Self::rect_hotbar(size, i)) {
                         return Some(TouchAction::SelectBlock(i));
@@ -835,6 +860,57 @@ impl TouchController {
     /// lib.rs), ya que un `MouseInput` no trae su propia coordenada.
     pub fn on_click_main_menu(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
         Self::hit_main_menu(pos, size)
+    }
+
+    /// Rectángulo del slot `index` (1..=9) en la grilla 3x3 del
+    /// inventario. Solo los primeros `BlockType::HOTBAR_SLOTS` (hoy 7)
+    /// tienen un material real — el resto se dibujan vacíos/atenuados
+    /// como espacio para futuros bloques, y no son clickeables (ver
+    /// `hit_inventory`).
+    pub(crate) fn rect_inventory_slot(size: PhysicalSize<u32>, index: u8) -> (f64, f64, f64, f64) {
+        let panel = Self::menu_panel_rect(size);
+        const CELL: f64 = 96.0;
+        const GAP: f64 = 18.0;
+        const COLS: i64 = 3;
+        let grid_w = CELL * COLS as f64 + GAP * (COLS as f64 - 1.0);
+        let start_x = panel.0 + (panel.2 - grid_w) * 0.5;
+        let start_y = panel.1 + 110.0;
+        let i0 = (index - 1) as i64;
+        let col = i0 % COLS;
+        let row = i0 / COLS;
+        let x = start_x + col as f64 * (CELL + GAP);
+        // +34 extra de alto por fila: deja lugar para el nombre del
+        // material dibujado debajo de cada ícono (ver
+        // `ui_overlay::build_inventory_screen`).
+        let y = start_y + row as f64 * (CELL + GAP + 34.0);
+        (x, y, CELL, CELL)
+    }
+
+    /// Hit-test de la pantalla de inventario: "< VOLVER" y cada slot con
+    /// material real (los vacíos, si los hay, no hacen nada al tocarlos).
+    fn hit_inventory(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if Self::point_in_rect(pos, Self::rect_back_button(size)) {
+            return Some(TouchAction::Back);
+        }
+        for i in 1..=crate::environment::chunk::BlockType::HOTBAR_SLOTS {
+            if Self::point_in_rect(pos, Self::rect_inventory_slot(size, i)) {
+                return Some(TouchAction::SelectInventorySlot(i));
+            }
+        }
+        None
+    }
+
+    /// Procesa un evento táctil en el inventario (Android).
+    pub fn on_touch_inventory(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+        if touch.phase != TouchPhase::Started {
+            return None;
+        }
+        Self::hit_inventory((touch.location.x, touch.location.y), size)
+    }
+
+    /// Equivalente de `on_touch_inventory` para un click de mouse (desktop).
+    pub fn on_click_inventory(&self, pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
+        Self::hit_inventory(pos, size)
     }
 
     /// Hit-test de la lista de mundos: "< VOLVER", "+ CREAR MUNDO NUEVO",

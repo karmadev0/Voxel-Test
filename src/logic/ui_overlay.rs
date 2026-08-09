@@ -650,6 +650,30 @@ pub fn build_debug_panel(
 const JOYSTICK_VISUAL_RADIUS: f64 = 70.0;
 const NUB_VISUAL_RADIUS: f64 = 26.0;
 
+/// Nombre del material seleccionado, mostrado un momento arriba de la
+/// hotbar cada vez que cambia la selección — igual que en Minecraft.
+/// `alpha` ya viene calculado por el llamador (ver `render()` en
+/// `lib.rs`: 1.0 mientras está "sostenido", después baja a 0.0 en un
+/// fundido) — acá solo se aplica a cada vértice.
+pub fn build_selected_block_popup(size: PhysicalSize<u32>, name: &str, alpha: f32) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(64);
+    let cx = size.width as f64 * 0.5;
+    let hotbar_top = size.height as f64 - 24.0 - 64.0; // MARGIN + HOTBAR_SIZE, ver touch.rs
+    let y = hotbar_top - 34.0;
+
+    // Fondito oscuro detrás del texto, para que se lea encima de
+    // cualquier fondo (cielo claro, nieve, etc.) — mismo criterio que
+    // el resto del HUD.
+    let text_w = text_width(name);
+    let pad_x = 14.0;
+    let bg_w = text_w + pad_x * 2.0;
+    let bg_h = FONT_CELL_H + 10.0;
+    push_quad(&mut v, size, (cx - bg_w * 0.5, y - 5.0, bg_w, bg_h), [0.05, 0.05, 0.08, 0.55 * alpha]);
+
+    push_text(&mut v, size, name, cx - text_w * 0.5, y, [1.0, 1.0, 1.0, alpha]);
+    v
+}
+
 /// Dibuja la hotbar de bloques (`BlockType::HOTBAR_SLOTS` slots,
 /// resaltando el seleccionado con un borde blanco). Independiente de
 /// touch: solo depende del tamaño de pantalla y del bloque seleccionado,
@@ -659,9 +683,14 @@ const NUB_VISUAL_RADIUS: f64 = 26.0;
 pub fn build_hotbar(size: PhysicalSize<u32>, selected_block: BlockType) -> Vec<UiVertex> {
     let mut verts = Vec::with_capacity(BlockType::HOTBAR_SLOTS as usize * 12);
     for i in 1..=BlockType::HOTBAR_SLOTS {
-        let block = BlockType::from_hotbar_slot(i);
-        let [r, g, b] = block.color();
         let rect = TouchController::rect_hotbar(size, i);
+        let Some(block) = BlockType::from_hotbar_slot(i) else {
+            // Slot vacío reservado (ver `BlockType::MATERIAL_COUNT`):
+            // solo el marco, nada seleccionable.
+            push_quad(&mut verts, size, rect, [0.12, 0.13, 0.16, 0.5]);
+            continue;
+        };
+        let [r, g, b] = block.color();
         let is_selected = block == selected_block;
         if is_selected {
             let pad = 6.0;
@@ -704,6 +733,15 @@ pub fn build_touch_overlay(
 
     // Hotbar.
     verts.extend(build_hotbar(size, selected_block));
+
+    // Botón "..." (abre el inventario completo, ver GameScreen::Inventory):
+    // un slot más pegado a la derecha de la hotbar.
+    let inv_rect = TouchController::rect_inventory_button(size);
+    push_quad(&mut verts, size, inv_rect, [0.16, 0.17, 0.22, 0.85]);
+    let dots = "...";
+    let dx = inv_rect.0 + (inv_rect.2 - text_width(dots)) * 0.5;
+    let dy = inv_rect.1 + (inv_rect.3 - FONT_CELL_H) * 0.5;
+    push_text(&mut verts, size, dots, dx, dy, [0.85, 0.88, 0.95, 1.0]);
 
     // Botón de configuración (engranaje): arriba a la derecha.
     let settings_rect = TouchController::rect_settings(size);
@@ -996,6 +1034,45 @@ pub fn build_settings_screen(
 
     push_back_button(&mut v, size);
     push_pause_note(&mut v, size, panel);
+    v
+}
+
+/// Inventario (Playing -> Inventory), abierto con "E" en desktop o el
+/// botón "..." en Android (ver `TouchAction::OpenInventory`). Grilla 3x3:
+/// a diferencia de la hotbar, acá se ve el NOMBRE de cada material (ver
+/// `BlockType::label`), no solo su color/textura — es la idea completa
+/// del pedido: poder elegir sabiendo qué es cada cosa. Los slots que
+/// sobran (si `BlockType::HOTBAR_SLOTS` < 9) quedan vacíos y atenuados,
+/// como espacio reservado para más materiales el día de mañana.
+pub fn build_inventory_screen(size: PhysicalSize<u32>, selected_block: BlockType) -> Vec<UiVertex> {
+    let mut v = Vec::with_capacity(512);
+    let panel = push_menu_panel_background(&mut v, size);
+    push_menu_title(&mut v, size, panel, "INVENTARIO");
+
+    for i in 1..=9u8 {
+        let rect = TouchController::rect_inventory_slot(size, i);
+
+        if let Some(block) = BlockType::from_hotbar_slot(i) {
+            let [r, g, b] = block.color();
+            let is_selected = block == selected_block;
+            if is_selected {
+                let pad = 5.0;
+                push_quad(&mut v, size, (rect.0 - pad, rect.1 - pad, rect.2 + pad * 2.0, rect.3 + pad * 2.0), [1.0, 1.0, 1.0, 0.9]);
+            }
+            push_quad(&mut v, size, rect, [r, g, b, 1.0]);
+
+            let label = block.label();
+            let lx = rect.0 + (rect.2 - text_width(label)) * 0.5;
+            let ly = rect.1 + rect.3 + 8.0;
+            let text_color = if is_selected { [1.0, 1.0, 0.75, 1.0] } else { [0.82, 0.85, 0.92, 1.0] };
+            push_text(&mut v, size, label, lx, ly, text_color);
+        } else {
+            // Slot vacío: solo el marco, sin nombre ni relleno de color.
+            push_quad(&mut v, size, rect, [0.14, 0.15, 0.19, 0.55]);
+        }
+    }
+
+    push_back_button(&mut v, size);
     v
 }
 

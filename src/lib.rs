@@ -86,6 +86,16 @@ enum GameScreen {
     ConfirmDeleteWorld,
     /// Juego corriendo normalmente.
     Playing,
+    /// Inventario: grilla de 9 slots para elegir el material a colocar,
+    /// con el nombre de cada uno a la vista (a diferencia de la hotbar,
+    /// que solo muestra el color/textura). Se abre con "E" en desktop o
+    /// el botón "..." en Android (ver `TouchAction::OpenInventory`), y
+    /// se cierra igual que Pause: con "E"/Esc, "< VOLVER", o eligiendo
+    /// un material (`TouchAction::SelectInventorySlot`, que selecciona
+    /// Y cierra en el mismo toque). El mundo queda congelado mientras
+    /// está abierto, mismo criterio que cualquier otra pantalla que no
+    /// sea `Playing`.
+    Inventory,
     /// Menú de pausa (antes esto era la única pantalla de
     /// "Configuración"): 3 botones — modo de juego, ajustes, salir.
     Pause,
@@ -500,6 +510,7 @@ impl State {
             saving_started: false,
             fluids: environment::fluids::FluidSim::new(),
             last_fluid_tick: Instant::now(),
+            hotbar_popup_since: None,
         }
     }
 
@@ -775,6 +786,7 @@ impl State {
             saving_started: false,
             fluids: environment::fluids::FluidSim::new(),
             last_fluid_tick: Instant::now(),
+            hotbar_popup_since: None,
         }
     }
 
@@ -953,7 +965,10 @@ impl State {
         match action {
             TouchAction::Place => self.handle_click(MouseButton::Right),
             TouchAction::SelectBlock(n) => {
-                self.selected_block = BlockType::from_hotbar_slot(n);
+                if let Some(block) = BlockType::from_hotbar_slot(n) {
+                    self.selected_block = block;
+                    self.hotbar_popup_since = Some(Instant::now());
+                }
             }
             TouchAction::PlayGame => {
                 // "JUGAR" ya no entra directo: abre la lista de mundos
@@ -1020,6 +1035,23 @@ impl State {
             TouchAction::OpenPause => {
                 self.game_screen = GameScreen::Pause;
             }
+            TouchAction::OpenInventory => {
+                self.game_screen = GameScreen::Inventory;
+            }
+            TouchAction::SelectInventorySlot(n) => {
+                // A diferencia de `SelectBlock` (tap en la hotbar
+                // mientras se juega, que no cierra nada), elegir un
+                // material acá cierra el inventario de una — no hace
+                // falta un paso de "confirmar", total no hay drag&drop
+                // entre slots, solo estás eligiendo qué tenés en la
+                // mano. Tocar un slot vacío no hace nada (ni
+                // selecciona ni cierra).
+                if let Some(block) = BlockType::from_hotbar_slot(n) {
+                    self.selected_block = block;
+                    self.hotbar_popup_since = Some(Instant::now());
+                    self.game_screen = GameScreen::Playing;
+                }
+            }
             TouchAction::OpenGameModeScreen => {
                 self.game_screen = GameScreen::GameMode;
             }
@@ -1065,6 +1097,7 @@ impl State {
                     GameScreen::Settings => self.settings_return,
                     GameScreen::SettingsMore => GameScreen::Settings,
                     GameScreen::Pause => GameScreen::Playing,
+                    GameScreen::Inventory => GameScreen::Playing,
                     GameScreen::WorldList => GameScreen::MainMenu,
                     GameScreen::NameWorld | GameScreen::ConfirmDeleteWorld => GameScreen::WorldList,
                     // `Saving` no tiene botón "< VOLVER" (no es
@@ -1734,6 +1767,7 @@ impl State {
                 ui_overlay::build_confirm_delete_screen(self.render.size, name)
             }
             GameScreen::Pause => ui_overlay::build_pause_screen(self.render.size),
+            GameScreen::Inventory => ui_overlay::build_inventory_screen(self.render.size, self.selected_block),
             GameScreen::GameMode => {
                 ui_overlay::build_gamemode_screen(self.render.size, self.game_mode.index())
             }
@@ -1768,6 +1802,31 @@ impl State {
                 // táctil.
                 #[cfg(not(target_os = "android"))]
                 verts.extend(ui_overlay::build_hotbar(self.render.size, self.selected_block));
+
+                // Nombre del material seleccionado, como en Minecraft:
+                // aparece un momento arriba de la hotbar cada vez que
+                // cambia la selección (tecla 1-9, tap en la hotbar, o
+                // elegido en el inventario — ver `hotbar_popup_since`,
+                // seteado en esos tres lugares) y se va apagando solo.
+                if let Some(since) = self.hotbar_popup_since {
+                    const HOLD_MS: u128 = 1200;
+                    const FADE_MS: u128 = 500;
+                    let elapsed = since.elapsed().as_millis();
+                    let alpha = if elapsed < HOLD_MS {
+                        1.0
+                    } else if elapsed < HOLD_MS + FADE_MS {
+                        1.0 - (elapsed - HOLD_MS) as f32 / FADE_MS as f32
+                    } else {
+                        0.0
+                    };
+                    if alpha > 0.0 {
+                        verts.extend(ui_overlay::build_selected_block_popup(
+                            self.render.size,
+                            self.selected_block.label(),
+                            alpha,
+                        ));
+                    }
+                }
                 // Contador de FPS en la esquina superior derecha.
                 if self.show_fps {
                     verts.extend(ui_overlay::build_fps_counter(self.current_fps, self.render.size));
@@ -2180,6 +2239,12 @@ struct App {
     // pueda inicializar el backend GL/EGL correctamente en Wayland — ver
     // el comentario en `run()` y en `render_state.rs`.
     display_handle: Option<winit::event_loop::OwnedDisplayHandle>,
+    /// Desde cuándo mostrar el popup con el nombre del material
+    /// seleccionado (ver el bloque en `render()` que lo dibuja arriba de
+    /// la hotbar). `None` = no mostrar nada. Se resetea a `Some(Instant::now())`
+    /// cada vez que cambia `selected_block` por cualquier vía (tecla,
+    /// tap en la hotbar, o elegido en el inventario).
+    hotbar_popup_since: Option<Instant>,
 }
 
 impl App {
@@ -2445,6 +2510,7 @@ impl ApplicationHandler for App {
                                     state.world_list_page,
                                 ),
                                 GameScreen::Pause => state.touch.on_click_pause(pos, size),
+                                GameScreen::Inventory => state.touch.on_click_inventory(pos, size),
                                 GameScreen::GameMode => state.touch.on_click_gamemode(pos, size),
                                 GameScreen::Settings => state.touch.on_click_settings(
                                     pos,
@@ -2500,6 +2566,7 @@ impl ApplicationHandler for App {
                             state.world_list_page,
                         ),
                         GameScreen::Pause => state.touch.on_touch_pause(touch, state.render.size),
+                        GameScreen::Inventory => state.touch.on_touch_inventory(touch, state.render.size),
                         GameScreen::GameMode => {
                             state.touch.on_touch_gamemode(touch, state.render.size)
                         }
@@ -2688,6 +2755,29 @@ impl ApplicationHandler for App {
                                 window.set_cursor_visible(false);
                             }
                         } else if event.state == ElementState::Pressed
+                            && code == winit::keyboard::KeyCode::KeyE
+                            && (state.game_screen == GameScreen::Playing
+                                || state.game_screen == GameScreen::Inventory)
+                        {
+                            // "E" abre/cierra el inventario — mismo
+                            // manejo de captura de mouse que Esc con
+                            // Pause (ver más abajo), porque acá no pasa
+                            // por `apply_menu_action` (eso lo usa
+                            // Android, que no tiene cursor que capturar).
+                            if state.game_screen == GameScreen::Playing {
+                                state.game_screen = GameScreen::Inventory;
+                                state.mouse_captured = false;
+                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                window.set_cursor_visible(true);
+                            } else {
+                                state.game_screen = GameScreen::Playing;
+                                state.last_frame = std::time::Instant::now();
+                                state.mouse_captured = true;
+                                let _ = window.set_cursor_grab(CursorGrabMode::Confined)
+                                    .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
+                                window.set_cursor_visible(false);
+                            }
+                        } else if event.state == ElementState::Pressed
                             && code == winit::keyboard::KeyCode::F5
                         {
                             let saved = state.world.save_dirty_chunks();
@@ -2725,9 +2815,14 @@ impl ApplicationHandler for App {
                                     | winit::keyboard::KeyCode::Digit5
                                     | winit::keyboard::KeyCode::Digit6
                                     | winit::keyboard::KeyCode::Digit7
+                                    | winit::keyboard::KeyCode::Digit8
+                                    | winit::keyboard::KeyCode::Digit9
                             )
                         {
                             // Selección de bloque para colocar (hotbar simple).
+                            // 8 y 9 no hacen nada por ahora: son slots
+                            // vacíos reservados (ver
+                            // `BlockType::MATERIAL_COUNT`).
                             let slot = match code {
                                 winit::keyboard::KeyCode::Digit1 => 1,
                                 winit::keyboard::KeyCode::Digit2 => 2,
@@ -2735,9 +2830,14 @@ impl ApplicationHandler for App {
                                 winit::keyboard::KeyCode::Digit4 => 4,
                                 winit::keyboard::KeyCode::Digit5 => 5,
                                 winit::keyboard::KeyCode::Digit6 => 6,
-                                _ => 7,
+                                winit::keyboard::KeyCode::Digit7 => 7,
+                                winit::keyboard::KeyCode::Digit8 => 8,
+                                _ => 9,
                             };
-                            state.selected_block = BlockType::from_hotbar_slot(slot);
+                            if let Some(block) = BlockType::from_hotbar_slot(slot) {
+                                state.selected_block = block;
+                                state.hotbar_popup_since = Some(std::time::Instant::now());
+                            }
                         } else {
                             state.camera.process_key(code, event.state);
                         }

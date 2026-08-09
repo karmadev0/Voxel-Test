@@ -209,6 +209,28 @@ fn greedy_sweep(
                 xb[axis] += 1;
                 let b = get_block(neighborhood, xb[0], xb[1], xb[2]);
 
+                // Agua con distinto nivel a los dos lados: ambas cuentan
+                // como "sólidas" para `is_solid` (ninguna es Aire), así
+                // que la rama de abajo no generaría ninguna cara acá —
+                // pero SÍ tienen distinta altura visual (ver
+                // `water_height_frac`), así que sin esto quedaba un
+                // hueco real en la malla justo donde el nivel más bajo
+                // no llega a tapar al más alto: el "rayos X" que se veía
+                // en los bordes de cualquier cuerpo de agua no uniforme.
+                let water_step = match (a, b) {
+                    (BlockType::Water(la), BlockType::Water(lb)) if la != lb => {
+                        // Elegir un único lado entre los dos pases
+                        // (backface=false/true) para emitir un solo
+                        // quad acá — si los dos pasaran la condición,
+                        // saldrían dos quads coincidentes en el mismo
+                        // plano (parpadeo por z-fighting). Con esta
+                        // comparación, para un mismo par (la, lb) fijo,
+                        // solo uno de los dos pases la cumple.
+                        (!backface && la < lb) || (backface && la > lb)
+                    }
+                    _ => false,
+                };
+
                 mask[n] = if a.is_solid() != b.is_solid() {
                     if backface {
                         if b.is_solid() { Some(b) } else { None }
@@ -217,6 +239,8 @@ fn greedy_sweep(
                     } else {
                         None
                     }
+                } else if water_step {
+                    Some(a)
                 } else {
                     None
                 };
