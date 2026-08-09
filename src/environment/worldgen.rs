@@ -292,18 +292,20 @@ impl WorldGenerator {
             .get([wx as f64 * 0.008 + 7_000.0, wz as f64 * 0.008 + 7_000.0]);
 
         // --- Cavernas "queso" ---
-        // Y con más frecuencia que X/Z (2.5x): la caverna cambia más
-        // rápido al moverse en vertical que en horizontal, así que
-        // queda comprimida en altura (salones de ~4-8 bloques) pero se
-        // extiende mucho más en el plano — ancha, no un pozo alto.
+        // Y con MUCHA más frecuencia que X/Z (5x): prioridad total a lo
+        // horizontal, como pediste — la caverna se aplana bastante en
+        // altura (salones de ~3-5 bloques, casi nunca más) pero se
+        // extiende mucho más en el plano. Antes esto estaba en 2.5x, que
+        // en la práctica seguía dejando ver embudos angostos abriéndose
+        // hacia arriba en vez de salones anchos.
         let base = self.cave_noise.get([
             wx as f64 * 0.045,
-            wy as f64 * 0.045 * 2.5,
+            wy as f64 * 0.045 * 5.0,
             wz as f64 * 0.045,
         ]);
         let detail = self.cave_noise.get([
             wx as f64 * 0.12 + 500.0,
-            wy as f64 * 0.12 * 2.5 + 500.0,
+            wy as f64 * 0.12 * 5.0 + 500.0,
             wz as f64 * 0.12 + 500.0,
         ]);
         let cheese_value = base * 0.75 + detail * 0.25;
@@ -314,18 +316,18 @@ impl WorldGenerator {
         let is_cheese = cheese_value > cheese_threshold;
 
         // --- Túneles "fideo" ---
-        // Mismo truco que arriba pero más marcado (3x en vez de 2.5x):
-        // pasillos bajos (2-4 bloques de alto) que se estiran mucho en
-        // horizontal — un corredor real, no una chimenea vertical.
+        // Mismo criterio, todavía más marcado (8x): pasillos bajos
+        // (2-3 bloques de alto) que se estiran mucho en horizontal —
+        // un corredor real, nunca una chimenea vertical.
         let tunnel_freq = 0.02;
         let t1 = self.cave_noise.get([
             wx as f64 * tunnel_freq + 9_000.0,
-            wy as f64 * tunnel_freq * 3.0 + 9_000.0,
+            wy as f64 * tunnel_freq * 8.0 + 9_000.0,
             wz as f64 * tunnel_freq + 9_000.0,
         ]);
         let t2 = self.cave_noise.get([
             wx as f64 * tunnel_freq - 9_000.0,
-            wy as f64 * tunnel_freq * 3.0 - 9_000.0,
+            wy as f64 * tunnel_freq * 8.0 - 9_000.0,
             wz as f64 * tunnel_freq - 9_000.0,
         ]);
         let tunnel_value = t1.abs() + t2.abs();
@@ -348,7 +350,7 @@ impl WorldGenerator {
     /// cada loma.
     fn ravine(&self, wx: i32, wy: i32, wz: i32, surface_height: usize) -> bool {
         const RAVINE_FREQ: f64 = 0.05;
-        const RAVINE_THRESHOLD: f64 = 0.8;
+        const RAVINE_THRESHOLD: f64 = 0.88;
         const RAVINE_DEPTH: i32 = 20;
 
         let bias = self
@@ -370,7 +372,7 @@ impl WorldGenerator {
     /// cueva orgánica realmente pase por ahí cerca del techo.
     fn entrance_zone(&self, wx: i32, wz: i32) -> bool {
         const ENTRANCE_FREQ: f64 = 0.015;
-        const ENTRANCE_THRESHOLD: f64 = 0.55;
+        const ENTRANCE_THRESHOLD: f64 = 0.68;
         let bias = self
             .noise
             .get([wx as f64 * ENTRANCE_FREQ + 40_000.0, wz as f64 * ENTRANCE_FREQ + 40_000.0]);
