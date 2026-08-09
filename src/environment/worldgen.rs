@@ -27,12 +27,27 @@ const TREE_MARGIN: i32 = 2;
 /// franja angosta de los valles más bajos, no la mitad del mapa.
 const SEA_LEVEL: usize = 16;
 
+/// Alto mínimo garantizado de una caverna "queso" (ver `banded_y`): 4
+/// bloques, cómodo para caminar parado sin agacharse en ningún punto.
+const CAVE_BAND_CHEESE: i32 = 4;
+/// Alto mínimo de un túnel "fideo" — un poco más angosto que las
+/// cavernas a propósito, para que se sientan pasillo y no salón, pero
+/// nunca por debajo de lo que el jugador puede atravesar caminando.
+const CAVE_BAND_TUNNEL: i32 = 3;
+
 /// Por debajo de esta altura absoluta, cualquier hueco de cueva (ver
 /// `is_cave`) se genera lleno de agua en vez de aire — lagos
 /// subterráneos, como los acuíferos de Minecraft. Deliberadamente más
 /// bajo que `SEA_LEVEL` para que la mayoría de las cuevas exploradas
 /// sigan secas; solo las más profundas se inundan.
 const CAVE_WATER_LEVEL: i32 = 10;
+
+/// A partir de esta altura de terreno (ver `height_at`, rango
+/// 8..~60) se considera "montaña" a los efectos de dónde preferir que
+/// aparezcan bocas de cueva (ver `entrance_zone`) — recreando el
+/// paisaje de Minecraft, donde las entradas de cueva más memorables
+/// están en las laderas, no en el pasto llano.
+const MOUNTAIN_HEIGHT: usize = 40;
 
 pub struct WorldGenerator {
     noise: Perlin,
@@ -281,7 +296,7 @@ impl WorldGenerator {
         // cueva no llega hasta ahí, sigue sellada igual que en el resto
         // del mapa. Así la boca queda con la forma orgánica de la cueva
         // (angosta, irregular) en vez de un agujero geométrico forzado.
-        let surface_buffer = if self.entrance_zone(wx, wz) { 1 } else { 4 };
+        let surface_buffer = if self.entrance_zone(wx, wz, surface_height) { 1 } else { 4 };
         let ceiling = surface_height as i32 - surface_buffer;
         if wy > ceiling {
             return false;
@@ -292,20 +307,20 @@ impl WorldGenerator {
             .get([wx as f64 * 0.008 + 7_000.0, wz as f64 * 0.008 + 7_000.0]);
 
         // --- Cavernas "queso" ---
-        // Y con MUCHA más frecuencia que X/Z (5x): prioridad total a lo
-        // horizontal, como pediste — la caverna se aplana bastante en
-        // altura (salones de ~3-5 bloques, casi nunca más) pero se
-        // extiende mucho más en el plano. Antes esto estaba en 2.5x, que
-        // en la práctica seguía dejando ver embudos angostos abriéndose
-        // hacia arriba en vez de salones anchos.
-        let base = self.cave_noise.get([
-            wx as f64 * 0.045,
-            wy as f64 * 0.045 * 5.0,
-            wz as f64 * 0.045,
-        ]);
+        // El multiplicador de frecuencia en Y (como estaba antes) hacía
+        // el trabajo de aplanar, pero tiene un efecto secundario: en
+        // los bordes de la banda que SÍ supera el umbral, esa banda
+        // puede llegar a durar un solo bloque de alto antes de volver a
+        // caer por debajo — resultado: cuevas de 1 bloque, injugables.
+        // La solución es cuantizar Y ANTES de muestrear (`banded_y`):
+        // adentro de una misma banda de `CAVE_BAND` bloques el ruido da
+        // siempre el mismo valor, así que si un punto es cueva, toda la
+        // banda entera (mínimo `CAVE_BAND` bloques) lo es también.
+        let by = Self::banded_y(wy, CAVE_BAND_CHEESE);
+        let base = self.cave_noise.get([wx as f64 * 0.045, by * 0.045, wz as f64 * 0.045]);
         let detail = self.cave_noise.get([
             wx as f64 * 0.12 + 500.0,
-            wy as f64 * 0.12 * 5.0 + 500.0,
+            by * 0.12 + 500.0,
             wz as f64 * 0.12 + 500.0,
         ]);
         let cheese_value = base * 0.75 + detail * 0.25;
@@ -316,18 +331,19 @@ impl WorldGenerator {
         let is_cheese = cheese_value > cheese_threshold;
 
         // --- Túneles "fideo" ---
-        // Mismo criterio, todavía más marcado (8x): pasillos bajos
-        // (2-3 bloques de alto) que se estiran mucho en horizontal —
-        // un corredor real, nunca una chimenea vertical.
+        // Mismo criterio de bandas, banda un poco más chica que el
+        // queso (`CAVE_BAND_TUNNEL` = 3, contra 4) para que se sientan
+        // pasillo y no salón, pero nunca por debajo de lo caminable.
         let tunnel_freq = 0.02;
+        let ty = Self::banded_y(wy, CAVE_BAND_TUNNEL);
         let t1 = self.cave_noise.get([
             wx as f64 * tunnel_freq + 9_000.0,
-            wy as f64 * tunnel_freq * 8.0 + 9_000.0,
+            ty * tunnel_freq + 9_000.0,
             wz as f64 * tunnel_freq + 9_000.0,
         ]);
         let t2 = self.cave_noise.get([
             wx as f64 * tunnel_freq - 9_000.0,
-            wy as f64 * tunnel_freq * 8.0 - 9_000.0,
+            ty * tunnel_freq - 9_000.0,
             wz as f64 * tunnel_freq - 9_000.0,
         ]);
         let tunnel_value = t1.abs() + t2.abs();
@@ -370,13 +386,37 @@ impl WorldGenerator {
     /// solo si hay una boca de cueva — solo baja el colchón en
     /// `is_cave`. Que la boca aparezca de verdad depende de que la
     /// cueva orgánica realmente pase por ahí cerca del techo.
-    fn entrance_zone(&self, wx: i32, wz: i32) -> bool {
+    ///
+    /// Sesgada hacia terreno de montaña (`MOUNTAIN_HEIGHT`): igual que
+    /// en Minecraft, las bocas de cueva "memorables" están en laderas,
+    /// no en pasto llano. En terreno bajo el umbral requerido sube
+    /// bastante, así que ahí siguen siendo mucho más raras (no
+    /// imposibles del todo, para no dejar el pasto llano 100% sin
+    /// ninguna).
+    fn entrance_zone(&self, wx: i32, wz: i32, surface_height: usize) -> bool {
         const ENTRANCE_FREQ: f64 = 0.015;
-        const ENTRANCE_THRESHOLD: f64 = 0.68;
+        const ENTRANCE_THRESHOLD_MOUNTAIN: f64 = 0.55;
+        const ENTRANCE_THRESHOLD_FLAT: f64 = 0.78;
+
+        let threshold = if surface_height >= MOUNTAIN_HEIGHT {
+            ENTRANCE_THRESHOLD_MOUNTAIN
+        } else {
+            ENTRANCE_THRESHOLD_FLAT
+        };
+
         let bias = self
             .noise
             .get([wx as f64 * ENTRANCE_FREQ + 40_000.0, wz as f64 * ENTRANCE_FREQ + 40_000.0]);
-        bias > ENTRANCE_THRESHOLD
+        bias > threshold
+    }
+
+    /// Cuantiza `wy` a la banda de `band` bloques que le corresponde
+    /// (ej. con `band=4`: 0..=3 -> 0.0, 4..=7 -> 4.0, ...). Usado para
+    /// muestrear el ruido de cuevas en vez de `wy` directo — ver el
+    /// comentario grande en `is_cave` sobre por qué, si no, aparecían
+    /// cuevas de 1 solo bloque de alto.
+    fn banded_y(wy: i32, band: i32) -> f64 {
+        (wy.div_euclid(band) * band) as f64
     }
 
     /// Combina varias octavas de ruido para un terreno con colinas suaves
