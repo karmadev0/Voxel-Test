@@ -307,20 +307,21 @@ impl WorldGenerator {
             .get([wx as f64 * 0.008 + 7_000.0, wz as f64 * 0.008 + 7_000.0]);
 
         // --- Cavernas "queso" ---
-        // El multiplicador de frecuencia en Y (como estaba antes) hacía
-        // el trabajo de aplanar, pero tiene un efecto secundario: en
-        // los bordes de la banda que SÍ supera el umbral, esa banda
-        // puede llegar a durar un solo bloque de alto antes de volver a
-        // caer por debajo — resultado: cuevas de 1 bloque, injugables.
-        // La solución es cuantizar Y ANTES de muestrear (`banded_y`):
-        // adentro de una misma banda de `CAVE_BAND` bloques el ruido da
-        // siempre el mismo valor, así que si un punto es cueva, toda la
-        // banda entera (mínimo `CAVE_BAND` bloques) lo es también.
+        // El multiplicador de frecuencia en Y (`CHEESE_Y_MULT`) es lo
+        // que sesga la FORMA hacia lo horizontal (Y cambia más rápido
+        // que X/Z, así que la región que supera el umbral se corta
+        // antes en altura que a lo ancho); la banda (`banded_y`) es lo
+        // que garantiza que, aun así, nunca quede más fina que
+        // `CAVE_BAND_CHEESE` bloques. Sin el multiplicador (como quedó
+        // sin querer al meter las bandas la vez pasada) las cuevas
+        // dejaban de tener ningún sesgo de forma y salían tan
+        // verticales como horizontales.
+        const CHEESE_Y_MULT: f64 = 3.0;
         let by = Self::banded_y(wy, CAVE_BAND_CHEESE);
-        let base = self.cave_noise.get([wx as f64 * 0.045, by * 0.045, wz as f64 * 0.045]);
+        let base = self.cave_noise.get([wx as f64 * 0.045, by * 0.045 * CHEESE_Y_MULT, wz as f64 * 0.045]);
         let detail = self.cave_noise.get([
             wx as f64 * 0.12 + 500.0,
-            by * 0.12 + 500.0,
+            by * 0.12 * CHEESE_Y_MULT + 500.0,
             wz as f64 * 0.12 + 500.0,
         ]);
         let cheese_value = base * 0.75 + detail * 0.25;
@@ -331,19 +332,26 @@ impl WorldGenerator {
         let is_cheese = cheese_value > cheese_threshold;
 
         // --- Túneles "fideo" ---
-        // Mismo criterio de bandas, banda un poco más chica que el
-        // queso (`CAVE_BAND_TUNNEL` = 3, contra 4) para que se sientan
-        // pasillo y no salón, pero nunca por debajo de lo caminable.
+        // Mismo criterio que el queso pero bastante más marcado
+        // (`TUNNEL_Y_MULT` = 8, contra 3 del queso): un gusano que no
+        // puede seguir derecho para abajo por mucho antes de que la
+        // banda de Y se le acabe, tiene que virar y seguir zigzagueando
+        // en el plano horizontal — así es como se consigue que la
+        // mayoría de los túneles se sientan largos pasillos horizontales
+        // que bajan de a poco, en vez de pozos rectos, sin dejar de
+        // tener algún tramo vertical de vez en cuando donde el ruido lo
+        // arma así.
+        const TUNNEL_Y_MULT: f64 = 8.0;
         let tunnel_freq = 0.02;
         let ty = Self::banded_y(wy, CAVE_BAND_TUNNEL);
         let t1 = self.cave_noise.get([
             wx as f64 * tunnel_freq + 9_000.0,
-            ty * tunnel_freq + 9_000.0,
+            ty * tunnel_freq * TUNNEL_Y_MULT + 9_000.0,
             wz as f64 * tunnel_freq + 9_000.0,
         ]);
         let t2 = self.cave_noise.get([
             wx as f64 * tunnel_freq - 9_000.0,
-            ty * tunnel_freq - 9_000.0,
+            ty * tunnel_freq * TUNNEL_Y_MULT - 9_000.0,
             wz as f64 * tunnel_freq - 9_000.0,
         ]);
         let tunnel_value = t1.abs() + t2.abs();

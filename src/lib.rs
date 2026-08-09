@@ -366,6 +366,13 @@ struct State {
     /// una copia para que `render`/hit-testing no tengan que leer el
     /// filesystem en cada frame.
     available_worlds: Vec<WorldMeta>,
+    /// Página actual (0-based) de `available_worlds` (ver
+    /// `TouchController::worldlist_rows_per_page`). Se resetea a 0 cada
+    /// vez que se refresca la lista (`TouchAction::PlayGame`) — si no,
+    /// borrar mundos hasta vaciar la última página dejaría al jugador
+    /// mirando una página vacía sin forma obvia de volver, ya que
+    /// "PÁGINA ANTERIOR" desaparece junto con las filas.
+    world_list_page: usize,
     /// Nombre del mundo actualmente cargado, si hay uno. `None` antes de
     /// entrar a jugar por primera vez (arranque en `MainMenu`).
     current_world_name: Option<String>,
@@ -483,6 +490,7 @@ impl State {
             chunk_result_tx,
             chunk_result_rx,
             available_worlds: Vec::new(),
+            world_list_page: 0,
             current_world_name: None,
             name_input: String::new(),
             name_preedit: String::new(),
@@ -757,6 +765,7 @@ impl State {
             chunk_result_tx,
             chunk_result_rx,
             available_worlds: Vec::new(),
+            world_list_page: 0,
             current_world_name: session.world_name,
             name_input: String::new(),
             name_preedit: String::new(),
@@ -783,6 +792,18 @@ impl State {
         } else {
             None
         }
+    }
+
+    /// Deja `world_list_page` dentro del rango válido para la cantidad
+    /// actual de `available_worlds` — necesario después de borrar un
+    /// mundo, porque eso puede vaciar justo la última página (ej.
+    /// estabas en la página 3 de 3, borraste el único mundo que
+    /// quedaba ahí, ahora solo hay 2 páginas).
+    fn clamp_world_list_page(&mut self) {
+        let rows_per_page = TouchController::worldlist_rows_per_page(self.render.size).max(1);
+        let page_count = (self.available_worlds.len() + rows_per_page - 1) / rows_per_page;
+        let max_page = page_count.saturating_sub(1);
+        self.world_list_page = self.world_list_page.min(max_page);
     }
 
     /// Re-genera el mesh de un chunk (o lo borra del mapa si quedó vacío)
@@ -939,6 +960,7 @@ impl State {
                 // guardados (refrescada desde disco acá mismo, por si se
                 // creó/borró algo mundo desde la última vez que se miró).
                 self.available_worlds = environment::save_manager::list_worlds();
+                self.world_list_page = 0;
                 self.game_screen = GameScreen::WorldList;
             }
             TouchAction::SelectWorld(index) => {
@@ -984,8 +1006,16 @@ impl State {
                         environment::save_manager::delete_world(&meta.name);
                     }
                     self.available_worlds = environment::save_manager::list_worlds();
+                    self.clamp_world_list_page();
                 }
                 self.game_screen = GameScreen::WorldList;
+            }
+            TouchAction::WorldListPrevPage => {
+                self.world_list_page = self.world_list_page.saturating_sub(1);
+            }
+            TouchAction::WorldListNextPage => {
+                self.world_list_page += 1;
+                self.clamp_world_list_page();
             }
             TouchAction::OpenPause => {
                 self.game_screen = GameScreen::Pause;
@@ -1692,7 +1722,7 @@ impl State {
             GameScreen::MainMenu => ui_overlay::build_main_menu_screen(self.render.size),
             GameScreen::WorldList => {
                 let names: Vec<String> = self.available_worlds.iter().map(|w| w.name.clone()).collect();
-                ui_overlay::build_worldlist_screen(self.render.size, &names)
+                ui_overlay::build_worldlist_screen(self.render.size, &names, self.world_list_page)
             }
             GameScreen::NameWorld => ui_overlay::build_nameworld_screen(self.render.size, &self.name_input, &self.name_preedit),
             GameScreen::ConfirmDeleteWorld => {
@@ -2412,6 +2442,7 @@ impl ApplicationHandler for App {
                                     pos,
                                     size,
                                     state.available_worlds.len(),
+                                    state.world_list_page,
                                 ),
                                 GameScreen::Pause => state.touch.on_click_pause(pos, size),
                                 GameScreen::GameMode => state.touch.on_click_gamemode(pos, size),
@@ -2466,6 +2497,7 @@ impl ApplicationHandler for App {
                             touch,
                             state.render.size,
                             state.available_worlds.len(),
+                            state.world_list_page,
                         ),
                         GameScreen::Pause => state.touch.on_touch_pause(touch, state.render.size),
                         GameScreen::GameMode => {

@@ -159,6 +159,22 @@ impl FluidSim {
         }
     }
 
+    /// Regla de "fuente infinita" de Minecraft: si `pos` tiene 2 o más
+    /// vecinos ortogonales (N/S/E/O, misma altura — nunca arriba/abajo
+    /// ni en diagonal) que son fuente (`Water(0)`), `pos` debería ser
+    /// fuente también. Es lo que hace que un pozo 2x2 con dos baldazos
+    /// de agua en esquinas opuestas termine siendo agua infinita, y que
+    /// una laguna hecha a mano se sienta "asentada" en vez de drenarse
+    /// sola con el tiempo.
+    fn should_become_source(world: &World, (x, y, z): (i32, i32, i32)) -> bool {
+        let dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        let sources = dirs
+            .iter()
+            .filter(|&&(dx, dz)| matches!(world.get_block(x + dx, y, z + dz), BlockType::Water(0)))
+            .count();
+        sources >= 2
+    }
+
     /// Procesa hasta `MAX_UPDATES_PER_TICK` posiciones de la cola.
     /// Devuelve los chunks que quedaron sucios (para remallar).
     pub fn tick(&mut self, world: &mut World) -> Vec<(i32, i32)> {
@@ -188,8 +204,15 @@ impl FluidSim {
 
             match current {
                 BlockType::Air => {
-                    // ¿Debería mojarse esta celda de aire?
-                    if let Some(level) = Self::desired_level(world, pos) {
+                    // Antes de fijarse si esparcirse normal la moja,
+                    // ¿ya nace como fuente por tener 2+ fuentes al lado?
+                    // (ver `should_become_source`). Si no, sigue la
+                    // regla de siempre.
+                    if Self::should_become_source(world, pos) {
+                        let changed = world.set_block(pos.0, pos.1, pos.2, BlockType::Water(0));
+                        dirty.extend(changed);
+                        self.enqueue_neighbors(pos);
+                    } else if let Some(level) = Self::desired_level(world, pos) {
                         let changed = world.set_block(pos.0, pos.1, pos.2, BlockType::Water(level));
                         dirty.extend(changed);
                         self.enqueue_neighbors(pos);
@@ -205,6 +228,16 @@ impl FluidSim {
                     self.enqueue_neighbors(pos);
                 }
                 BlockType::Water(current_level) => {
+                    // Mismo chequeo de fuente infinita, pero para agua
+                    // que YA estaba fluyendo (ej. dos baldazos que
+                    // recién ahora quedaron a 2 de distancia porque el
+                    // jugador acaba de colocar el segundo).
+                    if Self::should_become_source(world, pos) {
+                        let changed = world.set_block(pos.0, pos.1, pos.2, BlockType::Water(0));
+                        dirty.extend(changed);
+                        self.enqueue_neighbors(pos);
+                        continue;
+                    }
                     match Self::desired_level(world, pos) {
                         Some(level) if level <= current_level => {
                             // Sigue alimentada (y no le sobra nivel de

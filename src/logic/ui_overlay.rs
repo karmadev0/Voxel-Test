@@ -1001,10 +1001,13 @@ pub fn build_settings_screen(
 
 /// Lista de mundos guardados (MainMenu -> WorldList), alcanzable desde
 /// "JUGAR". "+ CREAR MUNDO NUEVO" arriba de todo, después una fila por
-/// cada mundo guardado (más reciente primero, ver
-/// `save_manager::list_worlds`). Sin nota "JUEGO PAUSADO": todavía no
-/// hay ninguna partida corriendo acá, igual que en `MainMenu`.
-pub fn build_worldlist_screen(size: PhysicalSize<u32>, world_names: &[String]) -> Vec<UiVertex> {
+/// cada mundo guardado de la página actual (más reciente primero, ver
+/// `save_manager::list_worlds`), y controles de página abajo si hay más
+/// de una (ver `TouchController::worldlist_rows_per_page`, que decide
+/// cuántas entran por página según el alto real de pantalla). Sin nota
+/// "JUEGO PAUSADO": todavía no hay ninguna partida corriendo acá, igual
+/// que en `MainMenu`.
+pub fn build_worldlist_screen(size: PhysicalSize<u32>, world_names: &[String], page: usize) -> Vec<UiVertex> {
     let mut v = Vec::with_capacity(512);
     let panel = push_menu_panel_background(&mut v, size);
     push_menu_title(&mut v, size, panel, "MUNDOS");
@@ -1016,24 +1019,59 @@ pub fn build_worldlist_screen(size: PhysicalSize<u32>, world_names: &[String]) -
         let cx = size.width as f64 * 0.5;
         let empty_y = create_rect.1 + create_rect.3 + 40.0;
         push_text_centered(&mut v, size, "TODAVIA NO HAY MUNDOS GUARDADOS", cx, empty_y, [0.6, 0.63, 0.7, 1.0]);
-    } else {
-        for (i, name) in world_names.iter().enumerate().take(TouchController::WORLDLIST_MAX_ROWS) {
-            let row = TouchController::rect_worldlist_row(size, i);
-            push_quad(&mut v, size, row, [0.14, 0.16, 0.22, 0.9]);
-            let lx = row.0 + 18.0;
-            let ly = row.1 + (row.3 - FONT_CELL_H) * 0.5;
-            push_text(&mut v, size, name, lx, ly, [0.85, 0.9, 1.0, 1.0]);
+        push_back_button(&mut v, size);
+        return v;
+    }
 
-            // Ícono de borrar ("X"), separado de la fila para que no se
-            // pueda tocar por error al elegir el mundo (ver
-            // `TouchController::rect_worldlist_delete_button`).
-            let del = TouchController::rect_worldlist_delete_button(size, i);
-            push_quad(&mut v, size, del, [0.30, 0.12, 0.14, 0.9]);
-            let x_label = "X";
-            let xlx = del.0 + (del.2 - text_width(x_label)) * 0.5;
-            let xly = del.1 + (del.3 - FONT_CELL_H) * 0.5;
-            push_text(&mut v, size, x_label, xlx, xly, [1.0, 0.6, 0.6, 1.0]);
+    let rows_per_page = TouchController::worldlist_rows_per_page(size).max(1);
+    let page_count = (world_names.len() + rows_per_page - 1) / rows_per_page;
+    let page_count = page_count.max(1);
+    let page = page.min(page_count - 1);
+    let page_start = page * rows_per_page;
+    let page_names = &world_names[page_start..(page_start + rows_per_page).min(world_names.len())];
+
+    for (i, name) in page_names.iter().enumerate() {
+        let row = TouchController::rect_worldlist_row(size, i);
+        push_quad(&mut v, size, row, [0.14, 0.16, 0.22, 0.9]);
+        let lx = row.0 + 18.0;
+        let ly = row.1 + (row.3 - FONT_CELL_H) * 0.5;
+        push_text(&mut v, size, name, lx, ly, [0.85, 0.9, 1.0, 1.0]);
+
+        // Ícono de borrar ("X"), separado de la fila para que no se
+        // pueda tocar por error al elegir el mundo (ver
+        // `TouchController::rect_worldlist_delete_button`).
+        let del = TouchController::rect_worldlist_delete_button(size, i);
+        push_quad(&mut v, size, del, [0.30, 0.12, 0.14, 0.9]);
+        let x_label = "X";
+        let xlx = del.0 + (del.2 - text_width(x_label)) * 0.5;
+        let xly = del.1 + (del.3 - FONT_CELL_H) * 0.5;
+        push_text(&mut v, size, x_label, xlx, xly, [1.0, 0.6, 0.6, 1.0]);
+    }
+
+    if page_count > 1 {
+        let cx = size.width as f64 * 0.5;
+        let prev = TouchController::rect_worldlist_page_prev(size);
+        let next = TouchController::rect_worldlist_page_next(size);
+        let label_y = prev.1 + (prev.3 - FONT_CELL_H) * 0.5;
+
+        // Botón anterior: solo se dibuja (y solo es clickeable, ver
+        // `hit_worldlist`) si no estamos ya en la primera página. Misma
+        // idea para el siguiente con la última.
+        if page > 0 {
+            push_quad(&mut v, size, prev, [0.14, 0.18, 0.26, 0.9]);
+            let label = "< ANTERIOR";
+            let lx = prev.0 + (prev.2 - text_width(label)) * 0.5;
+            push_text(&mut v, size, label, lx, label_y, [0.8, 0.88, 1.0, 1.0]);
         }
+        if page + 1 < page_count {
+            push_quad(&mut v, size, next, [0.14, 0.18, 0.26, 0.9]);
+            let label = "SIGUIENTE >";
+            let lx = next.0 + (next.2 - text_width(label)) * 0.5;
+            push_text(&mut v, size, label, lx, label_y, [0.8, 0.88, 1.0, 1.0]);
+        }
+
+        let page_label = format!("PAGINA {}/{}", page + 1, page_count);
+        push_text_centered(&mut v, size, &page_label, cx, label_y, [0.6, 0.68, 0.8, 1.0]);
     }
 
     push_back_button(&mut v, size);

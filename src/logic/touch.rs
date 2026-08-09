@@ -120,6 +120,13 @@ pub enum TouchAction {
     /// de verdad (el índice es la posición en `State::available_worlds`,
     /// igual que en `SelectWorld`).
     RequestDeleteWorld(usize),
+    /// Página anterior/siguiente en la lista de mundos (ver
+    /// `TouchController::worldlist_rows_per_page` — cuántas filas entran
+    /// por página depende del alto real de pantalla). Ambas se ignoran
+    /// silenciosamente si ya se está en la primera/última página; ver
+    /// `hit_worldlist`, que ni siquiera las devuelve en ese caso.
+    WorldListPrevPage,
+    WorldListNextPage,
     /// Tocó "BORRAR" en la pantalla de confirmación → borra de disco el
     /// mundo apuntado por `State::pending_delete_index` y vuelve a la
     /// lista ya refrescada. Cancelar esa pantalla reutiliza `Back`, no
@@ -293,16 +300,72 @@ impl TouchController {
 
     // --- Lista de mundos (MainMenu -> WorldList) ---
 
-    /// Cuántas filas de mundo entran en pantalla como máximo (si hay más
-    /// mundos guardados que esto, por ahora los de más abajo no son
-    /// clickeables — alcanza para esta parte, un scroll queda pendiente).
-    pub const WORLDLIST_MAX_ROWS: usize = 6;
+    /// Cuántas filas de mundo entran en una página, calculado según el
+    /// alto real de pantalla en vez de un número fijo — antes esto era
+    /// una constante (6) y, con más mundos que eso, los de abajo
+    /// directamente no eran clickeables. Ahora se reparten en páginas
+    /// (ver `rect_worldlist_page_prev`/`rect_worldlist_page_next`), y
+    /// cuántas entran por página depende de cuánto alto quede libre
+    /// entre el botón de crear y el margen inferior reservado para los
+    /// controles de página.
+    pub(crate) fn worldlist_rows_per_page(size: PhysicalSize<u32>) -> usize {
+        let create = Self::rect_worldlist_create_button(size);
+        let row_h = 60.0;
+        let gap = 12.0;
+        let rows_start_y = create.1 + create.3 + 22.0;
+        let panel = Self::menu_panel_rect(size);
+        let panel_bottom = panel.1 + panel.3;
+        // Deja lugar abajo para los controles "< PÁGINA X/Y >".
+        let available_h = (panel_bottom - Self::WORLDLIST_PAGER_RESERVED_H) - rows_start_y;
+        ((available_h + gap) / (row_h + gap)).floor().max(1.0) as usize
+    }
+
+    /// Alto reservado en la parte inferior del panel para los controles
+    /// de paginación, tanto acá (para calcular cuántas filas entran)
+    /// como en `ui_overlay::build_worldlist_screen` (para dibujarlos en
+    /// el mismo lugar).
+    pub(crate) const WORLDLIST_PAGER_RESERVED_H: f64 = 64.0;
 
     /// Ancho reservado a la derecha de cada fila para el botón de
     /// borrar (ver `rect_worldlist_delete_button`), separado del resto
     /// de la fila por `gap` px para que no se puedan tocar por error.
     const WORLDLIST_DELETE_BTN_SIZE: f64 = 44.0;
     const WORLDLIST_DELETE_BTN_GAP: f64 = 10.0;
+
+    /// Mismo rectángulo de panel que arma `ui_overlay::push_menu_panel_background`
+    /// (duplicado a propósito acá: `touch.rs` no depende de `ui_overlay.rs`,
+    /// y es un cálculo de una sola línea — más simple que reorganizar
+    /// módulos por esto).
+    fn menu_panel_rect(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let sw = size.width as f64;
+        let sh = size.height as f64;
+        let panel_w = 520.0_f64.min(sw * 0.85);
+        let panel_h = sh * 0.78;
+        let panel_x = sw * 0.5 - panel_w * 0.5;
+        let panel_y = sh * 0.14;
+        (panel_x, panel_y, panel_w, panel_h)
+    }
+
+    /// Botón "< PÁGINA ANTERIOR", abajo a la izquierda del panel de la
+    /// lista de mundos.
+    pub(crate) fn rect_worldlist_page_prev(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let panel = Self::menu_panel_rect(size);
+        let btn_w = 130.0;
+        let btn_h = 44.0;
+        let y = panel.1 + panel.3 - Self::WORLDLIST_PAGER_RESERVED_H + 10.0;
+        (panel.0 + 20.0, y, btn_w, btn_h)
+    }
+
+    /// Botón "PÁGINA SIGUIENTE >", abajo a la derecha del panel — mismo
+    /// Y que `rect_worldlist_page_prev`, alineados en la misma fila con
+    /// el indicador "X/Y" en el medio (ver `ui_overlay.rs`).
+    pub(crate) fn rect_worldlist_page_next(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
+        let panel = Self::menu_panel_rect(size);
+        let btn_w = 130.0;
+        let btn_h = 44.0;
+        let y = panel.1 + panel.3 - Self::WORLDLIST_PAGER_RESERVED_H + 10.0;
+        (panel.0 + panel.2 - 20.0 - btn_w, y, btn_w, btn_h)
+    }
 
     /// Botón "+ CREAR MUNDO NUEVO", arriba de la lista.
     pub(crate) fn rect_worldlist_create_button(size: PhysicalSize<u32>) -> (f64, f64, f64, f64) {
@@ -775,39 +838,57 @@ impl TouchController {
     }
 
     /// Hit-test de la lista de mundos: "< VOLVER", "+ CREAR MUNDO NUEVO",
-    /// el ícono de borrar y cada fila de mundo guardado (hasta
-    /// `WORLDLIST_MAX_ROWS`). `world_count` es cuántos mundos hay
-    /// realmente en la lista, para no devolver `SelectWorld`/
-    /// `RequestDeleteWorld` de una fila que no tiene mundo debajo.
-    fn hit_worldlist(pos: (f64, f64), size: PhysicalSize<u32>, world_count: usize) -> Option<TouchAction> {
+    /// los controles de página, y cada fila de mundo guardado de la
+    /// página actual. `world_count` es cuántos mundos hay realmente en
+    /// la lista (todas las páginas juntas); `page` es la página actual
+    /// (0-based) — los índices que devuelve acá para
+    /// `SelectWorld`/`RequestDeleteWorld` ya vienen traducidos a la
+    /// posición ABSOLUTA en `State::available_worlds`, no a la posición
+    /// dentro de la página.
+    fn hit_worldlist(pos: (f64, f64), size: PhysicalSize<u32>, world_count: usize, page: usize) -> Option<TouchAction> {
         if Self::point_in_rect(pos, Self::rect_back_button(size)) {
             return Some(TouchAction::Back);
         }
         if Self::point_in_rect(pos, Self::rect_worldlist_create_button(size)) {
             return Some(TouchAction::OpenNameWorld);
         }
-        for i in 0..world_count.min(Self::WORLDLIST_MAX_ROWS) {
+
+        let rows_per_page = Self::worldlist_rows_per_page(size).max(1);
+        let page_count = (world_count + rows_per_page - 1) / rows_per_page;
+        let page_count = page_count.max(1);
+
+        if page > 0 && Self::point_in_rect(pos, Self::rect_worldlist_page_prev(size)) {
+            return Some(TouchAction::WorldListPrevPage);
+        }
+        if page + 1 < page_count && Self::point_in_rect(pos, Self::rect_worldlist_page_next(size)) {
+            return Some(TouchAction::WorldListNextPage);
+        }
+
+        let page_start = page * rows_per_page;
+        let rows_in_page = world_count.saturating_sub(page_start).min(rows_per_page);
+        for i in 0..rows_in_page {
+            let absolute = page_start + i;
             if Self::point_in_rect(pos, Self::rect_worldlist_delete_button(size, i)) {
-                return Some(TouchAction::RequestDeleteWorld(i));
+                return Some(TouchAction::RequestDeleteWorld(absolute));
             }
             if Self::point_in_rect(pos, Self::rect_worldlist_row(size, i)) {
-                return Some(TouchAction::SelectWorld(i));
+                return Some(TouchAction::SelectWorld(absolute));
             }
         }
         None
     }
 
     /// Procesa un evento táctil en la lista de mundos (Android).
-    pub fn on_touch_worldlist(&self, touch: Touch, size: PhysicalSize<u32>, world_count: usize) -> Option<TouchAction> {
+    pub fn on_touch_worldlist(&self, touch: Touch, size: PhysicalSize<u32>, world_count: usize, page: usize) -> Option<TouchAction> {
         if touch.phase != TouchPhase::Started {
             return None;
         }
-        Self::hit_worldlist((touch.location.x, touch.location.y), size, world_count)
+        Self::hit_worldlist((touch.location.x, touch.location.y), size, world_count, page)
     }
 
     /// Equivalente de `on_touch_worldlist` para un click de mouse (desktop).
-    pub fn on_click_worldlist(&self, pos: (f64, f64), size: PhysicalSize<u32>, world_count: usize) -> Option<TouchAction> {
-        Self::hit_worldlist(pos, size, world_count)
+    pub fn on_click_worldlist(&self, pos: (f64, f64), size: PhysicalSize<u32>, world_count: usize, page: usize) -> Option<TouchAction> {
+        Self::hit_worldlist(pos, size, world_count, page)
     }
 
     fn hit_pause(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<TouchAction> {
