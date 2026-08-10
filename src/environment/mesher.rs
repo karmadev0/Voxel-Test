@@ -27,6 +27,19 @@ fn water_height_frac(level: u8) -> f32 {
     1.0 - (level as f32 + 1.0) / 9.0
 }
 
+/// Altura visual real de la cara de arriba de `block`, como fracción de
+/// un bloque completo. 1.0 para todo lo que no sea agua (siempre llega
+/// hasta el techo); `water_height_frac(level)` para agua. Usado por la
+/// máscara del sweep para saber cuándo dos bloques "sólidos" igual
+/// necesitan una pared entre ellos porque no tienen la misma altura
+/// real (ver `height_step` en `greedy_sweep`).
+fn top_height_frac(block: BlockType) -> f32 {
+    match block {
+        BlockType::Water(level) => water_height_frac(level),
+        _ => 1.0,
+    }
+}
+
 /// Fase 5: antes, el mesh de un chunk solo miraba sus propios bloques —
 /// en el borde con un chunk vecino, ese vecino se trataba siempre como
 /// aire, así que quedaban caras de más dibujadas ahí (invisibles para el
@@ -209,26 +222,29 @@ fn greedy_sweep(
                 xb[axis] += 1;
                 let b = get_block(neighborhood, xb[0], xb[1], xb[2]);
 
-                // Agua con distinto nivel a los dos lados: ambas cuentan
-                // como "sólidas" para `is_solid` (ninguna es Aire), así
-                // que la rama de abajo no generaría ninguna cara acá —
-                // pero SÍ tienen distinta altura visual (ver
-                // `water_height_frac`), así que sin esto quedaba un
-                // hueco real en la malla justo donde el nivel más bajo
-                // no llega a tapar al más alto: el "rayos X" que se veía
-                // en los bordes de cualquier cuerpo de agua no uniforme.
-                let water_step = match (a, b) {
-                    (BlockType::Water(la), BlockType::Water(lb)) if la != lb => {
-                        // Elegir un único lado entre los dos pases
-                        // (backface=false/true) para emitir un solo
-                        // quad acá — si los dos pasaran la condición,
-                        // saldrían dos quads coincidentes en el mismo
-                        // plano (parpadeo por z-fighting). Con esta
-                        // comparación, para un mismo par (la, lb) fijo,
-                        // solo uno de los dos pases la cumple.
-                        (!backface && la < lb) || (backface && la > lb)
-                    }
-                    _ => false,
+                // Cualquier bloque "sólido" cuya altura visual real no
+                // llegue al tope del block (hoy, solo el agua — ver
+                // `water_height_frac`) necesita una pared acá si el
+                // vecino de al lado NO tiene exactamente la misma
+                // altura, aunque los dos cuenten como "sólidos" para
+                // `is_solid`. Antes esto solo cubría agua-contra-agua
+                // con distinto nivel; pero una fuente (nivel 0) YA está
+                // un poco recortada (0.889 de 1.0) contra cualquier
+                // bloque normal de altura completa (tierra, pasto...),
+                // así que la orilla de cualquier lago/mar tenía el
+                // mismo hueco tipo rayos-X, no solo los bordes entre
+                // dos aguas de nivel distinto.
+                let frac_a = top_height_frac(a);
+                let frac_b = top_height_frac(b);
+                let height_step = a.is_solid() && b.is_solid() && frac_a != frac_b && {
+                    // Elegir un único lado entre los dos pases
+                    // (backface=false/true) para emitir un solo quad
+                    // acá — si los dos pasaran la condición, saldrían
+                    // dos quads coincidentes en el mismo plano
+                    // (parpadeo por z-fighting). Para un mismo par
+                    // (frac_a, frac_b) fijo, solo uno de los dos pases
+                    // cumple esta comparación.
+                    (!backface && frac_a < frac_b) || (backface && frac_a > frac_b)
                 };
 
                 mask[n] = if a.is_solid() != b.is_solid() {
@@ -239,8 +255,8 @@ fn greedy_sweep(
                     } else {
                         None
                     }
-                } else if water_step {
-                    Some(a)
+                } else if height_step {
+                    Some(if frac_a < frac_b { a } else { b })
                 } else {
                     None
                 };
