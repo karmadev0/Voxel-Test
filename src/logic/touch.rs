@@ -236,6 +236,13 @@ pub struct TouchController {
     pending_look_dy: f32,
     jump_held: bool,
     crouch_held: bool,
+    /// Slot del inventario que el dedo está apretando ahora mismo, sin
+    /// soltar todavía (ver `on_touch_inventory`). Mientras esto sea
+    /// `Some`, `inventory_hover_slot()` lo expone para que
+    /// `lib.rs::render()` dibuje el mismo tooltip flotante que ya usa
+    /// el hover de mouse en desktop — así "mantener apretado para ver
+    /// el nombre, soltar para confirmar" se siente igual que el hover.
+    pressed_inventory_slot: Option<u8>,
 }
 
 impl TouchController {
@@ -246,6 +253,7 @@ impl TouchController {
             pending_look_dy: 0.0,
             jump_held: false,
             crouch_held: false,
+            pressed_inventory_slot: None,
         }
     }
 
@@ -879,10 +887,7 @@ impl TouchController {
         let col = i0 % COLS;
         let row = i0 / COLS;
         let x = start_x + col as f64 * (CELL + GAP);
-        // +34 extra de alto por fila: deja lugar para el nombre del
-        // material dibujado debajo de cada ícono (ver
-        // `ui_overlay::build_inventory_screen`).
-        let y = start_y + row as f64 * (CELL + GAP + 34.0);
+        let y = start_y + row as f64 * (CELL + GAP);
         (x, y, CELL, CELL)
     }
 
@@ -900,12 +905,73 @@ impl TouchController {
         None
     }
 
-    /// Procesa un evento táctil en el inventario (Android).
-    pub fn on_touch_inventory(&self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
-        if touch.phase != TouchPhase::Started {
-            return None;
+    /// ¿Qué slot con material real (si hay alguno) cae debajo de `pos`?
+    /// A diferencia de `hit_inventory`, esto no mira el botón "< VOLVER"
+    /// ni le importan los slots vacíos — es solo "¿qué material hay
+    /// justo ahí", para el seguimiento de toque-y-mantener de abajo.
+    fn inventory_slot_at(pos: (f64, f64), size: PhysicalSize<u32>) -> Option<u8> {
+        (1..=crate::environment::chunk::BlockType::HOTBAR_SLOTS)
+            .find(|&i| Self::point_in_rect(pos, Self::rect_inventory_slot(size, i)))
+    }
+
+    /// Slot que hay que mostrar con el tooltip flotante ahora mismo en
+    /// Android — el que el dedo está apretando sin soltar todavía (ver
+    /// `on_touch_inventory`). En desktop esto siempre da `None`: ahí el
+    /// hover se calcula aparte, a partir de la posición del mouse (ver
+    /// `render()` en `lib.rs`), porque el mouse no genera
+    /// `WindowEvent::Touch`.
+    pub fn inventory_hover_slot(&self) -> Option<u8> {
+        self.pressed_inventory_slot
+    }
+
+    /// Procesa un evento táctil en el inventario (Android). A
+    /// diferencia del resto de las pantallas de menú (un toque = una
+    /// acción inmediata), acá el gesto es de dos tiempos, como el hover
+    /// de mouse en desktop pero adaptado a dedo:
+    /// - Al apoyar el dedo sobre un material, no se selecciona
+    ///   todavía — solo se marca como "apretado" para que
+    ///   `inventory_hover_slot()` lo exponga y aparezca el tooltip con
+    ///   el nombre (ver `push_item_tooltip` en `ui_overlay.rs`).
+    /// - Si se levanta el dedo sobre ESE MISMO slot, ahí sí se
+    ///   confirma la selección (y el inventario se cierra).
+    /// - Si el dedo se arrastra afuera antes de soltar, se cancela: no
+    ///   selecciona nada y el tooltip desaparece.
+    /// "< VOLVER" sigue siendo inmediato al toque, sin este paso
+    /// intermedio (no tiene nada que "previsualizar").
+    pub fn on_touch_inventory(&mut self, touch: Touch, size: PhysicalSize<u32>) -> Option<TouchAction> {
+        let pos = (touch.location.x, touch.location.y);
+        match touch.phase {
+            TouchPhase::Started => {
+                if Self::point_in_rect(pos, Self::rect_back_button(size)) {
+                    return Some(TouchAction::Back);
+                }
+                self.pressed_inventory_slot = Self::inventory_slot_at(pos, size);
+                None
+            }
+            TouchPhase::Moved => {
+                // Si se arrastra afuera del slot que estaba apretado,
+                // se cancela la previsualización (no la selección: esa
+                // recién se decide al soltar).
+                if self.pressed_inventory_slot.is_some()
+                    && self.pressed_inventory_slot != Self::inventory_slot_at(pos, size)
+                {
+                    self.pressed_inventory_slot = None;
+                }
+                None
+            }
+            TouchPhase::Ended => {
+                let pressed = self.pressed_inventory_slot.take();
+                if pressed.is_some() && pressed == Self::inventory_slot_at(pos, size) {
+                    pressed.map(TouchAction::SelectInventorySlot)
+                } else {
+                    None
+                }
+            }
+            TouchPhase::Cancelled => {
+                self.pressed_inventory_slot = None;
+                None
+            }
         }
-        Self::hit_inventory((touch.location.x, touch.location.y), size)
     }
 
     /// Equivalente de `on_touch_inventory` para un click de mouse (desktop).

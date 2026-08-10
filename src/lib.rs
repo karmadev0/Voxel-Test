@@ -1767,7 +1767,25 @@ impl State {
                 ui_overlay::build_confirm_delete_screen(self.render.size, name)
             }
             GameScreen::Pause => ui_overlay::build_pause_screen(self.render.size),
-            GameScreen::Inventory => ui_overlay::build_inventory_screen(self.render.size, self.selected_block),
+            GameScreen::Inventory => {
+                // ¿Sobre qué slot está el mouse ahora mismo? En
+                // desktop, el cursor está libre acá (ver el "E" que lo
+                // suelta al abrir esta pantalla). En Android no hay
+                // cursor — ahí el equivalente es `inventory_hover_slot`,
+                // el slot que el dedo está apretando sin soltar todavía
+                // (ver `TouchController::on_touch_inventory`: soltar
+                // sobre el mismo slot confirma la selección, arrastrar
+                // afuera cancela).
+                let mouse_hover = (1..=9u8).find(|&i| {
+                    let r = TouchController::rect_inventory_slot(self.render.size, i);
+                    self.cursor_pos.0 >= r.0
+                        && self.cursor_pos.0 <= r.0 + r.2
+                        && self.cursor_pos.1 >= r.1
+                        && self.cursor_pos.1 <= r.1 + r.3
+                });
+                let hover_slot = mouse_hover.or(self.touch.inventory_hover_slot());
+                ui_overlay::build_inventory_screen(self.render.size, self.selected_block, hover_slot)
+            }
             GameScreen::GameMode => {
                 ui_overlay::build_gamemode_screen(self.render.size, self.game_mode.index())
             }

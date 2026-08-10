@@ -1038,13 +1038,14 @@ pub fn build_settings_screen(
 }
 
 /// Inventario (Playing -> Inventory), abierto con "E" en desktop o el
-/// botón "..." en Android (ver `TouchAction::OpenInventory`). Grilla 3x3:
-/// a diferencia de la hotbar, acá se ve el NOMBRE de cada material (ver
-/// `BlockType::label`), no solo su color/textura — es la idea completa
-/// del pedido: poder elegir sabiendo qué es cada cosa. Los slots que
-/// sobran (si `BlockType::HOTBAR_SLOTS` < 9) quedan vacíos y atenuados,
-/// como espacio reservado para más materiales el día de mañana.
-pub fn build_inventory_screen(size: PhysicalSize<u32>, selected_block: BlockType) -> Vec<UiVertex> {
+/// botón "..." en Android (ver `TouchAction::OpenInventory`). Grilla 3x3
+/// de íconos sin texto fijo — el nombre de cada material aparece en un
+/// mini cuadro flotante al lado, solo mientras el mouse está encima
+/// (`hover_slot`, calculado en `lib.rs::render()` comparando el cursor
+/// contra cada slot), igual que los tooltips de items en Minecraft. Los
+/// slots que sobran (si `BlockType::HOTBAR_SLOTS` < 9) quedan vacíos y
+/// atenuados, como espacio reservado para futuros bloques.
+pub fn build_inventory_screen(size: PhysicalSize<u32>, selected_block: BlockType, hover_slot: Option<u8>) -> Vec<UiVertex> {
     let mut v = Vec::with_capacity(512);
     let panel = push_menu_panel_background(&mut v, size);
     push_menu_title(&mut v, size, panel, "INVENTARIO");
@@ -1055,25 +1056,54 @@ pub fn build_inventory_screen(size: PhysicalSize<u32>, selected_block: BlockType
         if let Some(block) = BlockType::from_hotbar_slot(i) {
             let [r, g, b] = block.color();
             let is_selected = block == selected_block;
+            let is_hovered = hover_slot == Some(i);
             if is_selected {
                 let pad = 5.0;
                 push_quad(&mut v, size, (rect.0 - pad, rect.1 - pad, rect.2 + pad * 2.0, rect.3 + pad * 2.0), [1.0, 1.0, 1.0, 0.9]);
+            } else if is_hovered {
+                // Borde más tenue que el de "seleccionado", para poder
+                // distinguir a simple vista "esto es lo que tengo en la
+                // mano" de "esto es lo que estoy mirando ahora".
+                let pad = 4.0;
+                push_quad(&mut v, size, (rect.0 - pad, rect.1 - pad, rect.2 + pad * 2.0, rect.3 + pad * 2.0), [1.0, 1.0, 1.0, 0.45]);
             }
             push_quad(&mut v, size, rect, [r, g, b, 1.0]);
 
-            let label = block.label();
-            let lx = rect.0 + (rect.2 - text_width(label)) * 0.5;
-            let ly = rect.1 + rect.3 + 8.0;
-            let text_color = if is_selected { [1.0, 1.0, 0.75, 1.0] } else { [0.82, 0.85, 0.92, 1.0] };
-            push_text(&mut v, size, label, lx, ly, text_color);
+            if is_hovered {
+                push_item_tooltip(&mut v, size, rect, block.label());
+            }
         } else {
-            // Slot vacío: solo el marco, sin nombre ni relleno de color.
+            // Slot vacío: solo el marco, nada que mostrar ni al hacer hover.
             push_quad(&mut v, size, rect, [0.14, 0.15, 0.19, 0.55]);
         }
     }
 
     push_back_button(&mut v, size);
     v
+}
+
+/// Mini cuadro flotante con el nombre de un material, pegado al lado
+/// derecho de `slot_rect` — el tooltip de item de Minecraft. Si no
+/// entra a la derecha (el slot está muy pegado al borde de la
+/// pantalla), se dibuja a la izquierda en su lugar.
+fn push_item_tooltip(v: &mut Vec<UiVertex>, size: PhysicalSize<u32>, slot_rect: (f64, f64, f64, f64), name: &str) {
+    let pad_x = 12.0;
+    let text_w = text_width(name);
+    let box_w = text_w + pad_x * 2.0;
+    let box_h = FONT_CELL_H + 12.0;
+    let gap = 10.0;
+
+    let fits_right = slot_rect.0 + slot_rect.2 + gap + box_w <= size.width as f64;
+    let box_x = if fits_right {
+        slot_rect.0 + slot_rect.2 + gap
+    } else {
+        slot_rect.0 - gap - box_w
+    };
+    let box_y = slot_rect.1 + (slot_rect.3 - box_h) * 0.5;
+
+    push_quad(v, size, (box_x - 2.0, box_y - 2.0, box_w + 4.0, box_h + 4.0), [0.5, 0.6, 0.85, 0.5]);
+    push_quad(v, size, (box_x, box_y, box_w, box_h), [0.06, 0.06, 0.10, 0.96]);
+    push_text(v, size, name, box_x + pad_x, box_y + 6.0, [1.0, 1.0, 1.0, 1.0]);
 }
 
 /// Lista de mundos guardados (MainMenu -> WorldList), alcanzable desde
