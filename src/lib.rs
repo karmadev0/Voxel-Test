@@ -442,6 +442,12 @@ struct State {
     /// `last_autosave`, pero con un intervalo fijo y bastante más
     /// corto: ver `FLUID_TICK_MS` en `update()`).
     last_fluid_tick: Instant,
+    /// Desde cuándo mostrar el popup con el nombre del material
+    /// seleccionado (ver el bloque en `render()` que lo dibuja arriba de
+    /// la hotbar). `None` = no mostrar nada. Se resetea a `Some(Instant::now())`
+    /// cada vez que cambia `selected_block` por cualquier vía (tecla,
+    /// tap en la hotbar, o elegido en el inventario).
+    hotbar_popup_since: Option<Instant>,
 }
 
 impl State {
@@ -2257,12 +2263,6 @@ struct App {
     // pueda inicializar el backend GL/EGL correctamente en Wayland — ver
     // el comentario en `run()` y en `render_state.rs`.
     display_handle: Option<winit::event_loop::OwnedDisplayHandle>,
-    /// Desde cuándo mostrar el popup con el nombre del material
-    /// seleccionado (ver el bloque en `render()` que lo dibuja arriba de
-    /// la hotbar). `None` = no mostrar nada. Se resetea a `Some(Instant::now())`
-    /// cada vez que cambia `selected_block` por cualquier vía (tecla,
-    /// tap en la hotbar, o elegido en el inventario).
-    hotbar_popup_since: Option<Instant>,
 }
 
 impl App {
